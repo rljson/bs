@@ -1,9 +1,9 @@
 {
-  "name": "@rljson/template-project",
+  "name": "@rljson/bs",
   "version": "0.0.18",
-  "description": "Rljson template-project description",
-  "homepage": "https://github.com/rljson/template-project",
-  "bugs": "https://github.com/rljson/template-project/issues",
+  "description": "Blob storage interface and implementations for rljson",
+  "homepage": "https://github.com/rljson/bs",
+  "bugs": "https://github.com/rljson/bs/issues",
   "private": false,
   "license": "MIT",
   "engines": {
@@ -11,16 +11,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/rljson/template-project.git"
+    "url": "git+https://github.com/rljson/bs.git"
   },
-  "main": "dist/template-project.js",
+  "main": "dist/bs.js",
   "types": "dist/index.d.ts",
   "files": [
     "dist"
   ],
   "type": "module",
   "scripts": {
-    "build": "pnpx vite build && tsc && node scripts/copy-readme-to-dist.js",
+    "build": "pnpx vite build && tsc && node scripts/copy-readme-to-dist.js && node scripts/deploy-conformance-tests.js",
     "test": "pnpx vitest run --coverage && pnpm run lint",
     "prebuild": "npm run test",
     "prepublishOnly": "npm run build",
@@ -49,7 +49,7 @@
     "vitest-dom": "^0.1.1"
   },
   "dependencies": {
-    "@rljson/hash": "^0.0.17",
+    "@rljson/hash": "^0.0.18",
     "@rljson/json": "^0.0.23",
     "@rljson/rljson": "^0.0.73"
   },

@@ -1,0 +1,376 @@
+// @license
+// Copyright (c) 2026 Rljson
+//
+// Use of this source code is governed by terms that can be
+// found in the LICENSE file in the root of this package.
+
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+} from 'vitest';
+
+import { Bs, BsTestSetup } from '../src';
+
+import { testSetup } from './bs-conformance.setup.ts';
+
+/**
+ * Conformance tests for Bs implementations.
+ * Any implementation of the Bs interface should pass these tests.
+ *
+ * @param externalTestSetup - Optional test setup for external implementations
+ */
+export const runBsConformanceTests = (
+  externalTestSetup?: () => BsTestSetup,
+) => {
+  return describe('Bs Conformance', () => {
+    let bs: Bs;
+    let setup: BsTestSetup;
+
+    beforeAll(async () => {
+      setup = externalTestSetup ? externalTestSetup() : testSetup();
+      await setup.beforeAll();
+    });
+
+    beforeEach(async () => {
+      await setup.beforeEach();
+      bs = setup.bs;
+    });
+
+    afterEach(async () => {
+      await setup.afterEach();
+    });
+
+    afterAll(async () => {
+      await setup.afterAll();
+    });
+
+    describe('setBlob', () => {
+      it('should store a blob from Buffer and return properties', async () => {
+        const content = Buffer.from('Hello, World!');
+        const result = await bs.setBlob(content);
+
+        expect(result.blobId).toBeDefined();
+        expect(result.blobId).toHaveLength(22);
+        expect(result.size).toBe(13);
+        expect(result.createdAt).toBeInstanceOf(Date);
+      });
+
+      it('should store a blob from string', async () => {
+        const content = 'Test string content';
+        const result = await bs.setBlob(content);
+
+        expect(result.blobId).toBeDefined();
+        expect(result.size).toBe(19);
+      });
+
+      it('should store a blob from ReadableStream', async () => {
+        const content = 'Stream content';
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(content));
+            controller.close();
+          },
+        });
+
+        const result = await bs.setBlob(stream);
+
+        expect(result.blobId).toBeDefined();
+        expect(result.size).toBe(14);
+      });
+
+      it('should deduplicate identical content', async () => {
+        const content = Buffer.from('Duplicate content');
+
+        const result1 = await bs.setBlob(content);
+        const result2 = await bs.setBlob(content);
+
+        expect(result1.blobId).toBe(result2.blobId);
+        expect(result1.createdAt).toEqual(result2.createdAt);
+      });
+
+      it('should generate different blob IDs for different content', async () => {
+        const content1 = Buffer.from('Content 1');
+        const content2 = Buffer.from('Content 2');
+
+        const result1 = await bs.setBlob(content1);
+        const result2 = await bs.setBlob(content2);
+
+        expect(result1.blobId).not.toBe(result2.blobId);
+      });
+
+      it('should handle empty content', async () => {
+        const empty = Buffer.from('');
+        const result = await bs.setBlob(empty);
+
+        expect(result.blobId).toBeDefined();
+        expect(result.size).toBe(0);
+      });
+
+      it('should handle binary content', async () => {
+        const binaryData = Buffer.from([0, 1, 2, 3, 255, 254, 253]);
+        const result = await bs.setBlob(binaryData);
+
+        expect(result.blobId).toBeDefined();
+        expect(result.size).toBe(7);
+      });
+    });
+
+    describe('getBlob', () => {
+      it('should retrieve stored blob', async () => {
+        const content = Buffer.from('Retrieve me!');
+        const { blobId } = await bs.setBlob(content);
+
+        const result = await bs.getBlob(blobId);
+
+        expect(result.content.toString()).toBe('Retrieve me!');
+        expect(result.properties.blobId).toBe(blobId);
+        expect(result.properties.size).toBe(12);
+      });
+
+      it('should throw error for non-existent blob', async () => {
+        await expect(bs.getBlob('nonexistent1234567890')).rejects.toThrow(
+          'Blob not found',
+        );
+      });
+
+      it('should support range requests', async () => {
+        const content = Buffer.from('0123456789');
+        const { blobId } = await bs.setBlob(content);
+
+        const result = await bs.getBlob(blobId, {
+          range: { start: 2, end: 5 },
+        });
+
+        expect(result.content.toString()).toBe('234');
+      });
+
+      it('should retrieve binary content correctly', async () => {
+        const binaryData = Buffer.from([0, 1, 2, 3, 255, 254, 253]);
+        const { blobId } = await bs.setBlob(binaryData);
+
+        const result = await bs.getBlob(blobId);
+
+        expect(result.content).toEqual(binaryData);
+      });
+    });
+
+    describe('getBlobStream', () => {
+      it('should return a ReadableStream for blob', async () => {
+        const content = Buffer.from('Stream this content');
+        const { blobId } = await bs.setBlob(content);
+
+        const stream = await bs.getBlobStream(blobId);
+
+        expect(stream).toBeInstanceOf(ReadableStream);
+
+        const reader = stream.getReader();
+        const chunks: Uint8Array[] = [];
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+        }
+
+        const result = Buffer.concat(chunks).toString();
+        expect(result).toBe('Stream this content');
+      });
+
+      it('should throw error for non-existent blob', async () => {
+        await expect(bs.getBlobStream('nonexistent1234567890')).rejects.toThrow(
+          'Blob not found',
+        );
+      });
+    });
+
+    describe('deleteBlob', () => {
+      it('should delete an existing blob', async () => {
+        const content = Buffer.from('Delete me');
+        const { blobId } = await bs.setBlob(content);
+
+        expect(await bs.blobExists(blobId)).toBe(true);
+
+        await bs.deleteBlob(blobId);
+
+        expect(await bs.blobExists(blobId)).toBe(false);
+      });
+
+      it('should throw error when deleting non-existent blob', async () => {
+        await expect(bs.deleteBlob('nonexistent1234567890')).rejects.toThrow(
+          'Blob not found',
+        );
+      });
+    });
+
+    describe('blobExists', () => {
+      it('should return true for existing blob', async () => {
+        const content = Buffer.from('I exist');
+        const { blobId } = await bs.setBlob(content);
+
+        expect(await bs.blobExists(blobId)).toBe(true);
+      });
+
+      it('should return false for non-existent blob', async () => {
+        expect(await bs.blobExists('nonexistent1234567890')).toBe(false);
+      });
+    });
+
+    describe('getBlobProperties', () => {
+      it('should return properties for existing blob', async () => {
+        const content = Buffer.from('Properties test');
+        const { blobId, size, createdAt } = await bs.setBlob(content);
+
+        const properties = await bs.getBlobProperties(blobId);
+
+        expect(properties.blobId).toBe(blobId);
+        expect(properties.size).toBe(size);
+        expect(properties.createdAt).toEqual(createdAt);
+      });
+
+      it('should throw error for non-existent blob', async () => {
+        await expect(
+          bs.getBlobProperties('nonexistent1234567890'),
+        ).rejects.toThrow('Blob not found');
+      });
+    });
+
+    describe('listBlobs', () => {
+      it('should return empty list when no blobs', async () => {
+        const result = await bs.listBlobs();
+
+        expect(result.blobs).toEqual([]);
+        expect(result.continuationToken).toBeUndefined();
+      });
+
+      it('should list all blobs', async () => {
+        await bs.setBlob('Blob 1');
+        await bs.setBlob('Blob 2');
+        await bs.setBlob('Blob 3');
+
+        const result = await bs.listBlobs();
+
+        expect(result.blobs).toHaveLength(3);
+        expect(result.continuationToken).toBeUndefined();
+      });
+
+      it('should filter by prefix', async () => {
+        const blob1 = await bs.setBlob('Blob 1');
+        await bs.setBlob('Blob 2');
+        await bs.setBlob('Blob 3');
+
+        const prefix = blob1.blobId.substring(0, 2);
+
+        const result = await bs.listBlobs({ prefix });
+
+        expect(result.blobs.length).toBeGreaterThanOrEqual(1);
+        expect(result.blobs.every((b) => b.blobId.startsWith(prefix))).toBe(
+          true,
+        );
+      });
+
+      it('should support pagination with maxResults', async () => {
+        await bs.setBlob('Blob 1');
+        await bs.setBlob('Blob 2');
+        await bs.setBlob('Blob 3');
+        await bs.setBlob('Blob 4');
+
+        const page1 = await bs.listBlobs({ maxResults: 2 });
+
+        expect(page1.blobs).toHaveLength(2);
+        expect(page1.continuationToken).toBeDefined();
+      });
+
+      it('should paginate through all results', async () => {
+        await bs.setBlob('Blob 1');
+        await bs.setBlob('Blob 2');
+        await bs.setBlob('Blob 3');
+        await bs.setBlob('Blob 4');
+        await bs.setBlob('Blob 5');
+
+        const allBlobs: string[] = [];
+        let continuationToken: string | undefined;
+
+        do {
+          const page = await bs.listBlobs({
+            maxResults: 2,
+            continuationToken,
+          });
+          allBlobs.push(...page.blobs.map((b) => b.blobId));
+          continuationToken = page.continuationToken;
+        } while (continuationToken);
+
+        expect(allBlobs).toHaveLength(5);
+        expect(new Set(allBlobs).size).toBe(5);
+      });
+
+      it('should return blobs in consistent order', async () => {
+        await bs.setBlob('C');
+        await bs.setBlob('A');
+        await bs.setBlob('B');
+
+        const result1 = await bs.listBlobs();
+        const result2 = await bs.listBlobs();
+
+        expect(result1.blobs.map((b) => b.blobId)).toEqual(
+          result2.blobs.map((b) => b.blobId),
+        );
+      });
+    });
+
+    describe('generateSignedUrl', () => {
+      it('should generate a signed URL for existing blob', async () => {
+        const content = Buffer.from('Sign me');
+        const { blobId } = await bs.setBlob(content);
+
+        const url = await bs.generateSignedUrl(blobId, 3600);
+
+        expect(url).toContain(blobId);
+        expect(url).toContain('expires=');
+        expect(url).toContain('permissions=read');
+      });
+
+      it('should support different permissions', async () => {
+        const content = Buffer.from('Delete permission');
+        const { blobId } = await bs.setBlob(content);
+
+        const url = await bs.generateSignedUrl(blobId, 3600, 'delete');
+
+        expect(url).toContain('permissions=delete');
+      });
+
+      it('should throw error for non-existent blob', async () => {
+        await expect(
+          bs.generateSignedUrl('nonexistent1234567890', 3600),
+        ).rejects.toThrow('Blob not found');
+      });
+    });
+
+    describe('content-addressable behavior', () => {
+      it('should generate same blob ID for same content', async () => {
+        const content = 'Identical content';
+
+        const result1 = await bs.setBlob(content);
+        const result2 = await bs.setBlob(content);
+
+        expect(result1.blobId).toBe(result2.blobId);
+      });
+
+      it('should handle large content', async () => {
+        const largeContent = Buffer.alloc(1024 * 1024, 'x'); // 1MB
+        const result = await bs.setBlob(largeContent);
+
+        expect(result.size).toBe(1024 * 1024);
+
+        const retrieved = await bs.getBlob(result.blobId);
+        expect(retrieved.content.length).toBe(1024 * 1024);
+      });
+    });
+  });
+};
+
+// Run conformance tests for BsMem
+runBsConformanceTests();
