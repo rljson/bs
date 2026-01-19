@@ -26,6 +26,7 @@ export default defineConfig({
         '@rljson/json',
         '@rljson/hash',
         // Add all peer depencies from package.json here
+        'node:stream',
       ],
       output: {
         globals: {},

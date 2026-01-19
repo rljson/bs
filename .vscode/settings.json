@@ -534,5 +534,10 @@
     "upate",
     "yrqcs"
   ],
-  "editor.codeLens": false
+  "editor.codeLens": false,
+  "workbench.colorCustomizations": {
+    "activityBar.background": "#00474f",
+    "titleBar.activeBackground": "#006772",
+    "titleBar.activeForeground": "#FBFAFA"
+  }
 }
