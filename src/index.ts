@@ -6,6 +6,9 @@
 
 // Blob Storage
 export { BsMem } from './bs-mem.js';
+export { BsMulti, type BsMultiBs } from './bs-multi.js';
+export { BsPeer } from './bs-peer.js';
+export { BsServer } from './bs-server.js';
 export type { BsTestSetup } from './bs-test-setup.js';
 export type {
   BlobProperties,
@@ -14,3 +17,8 @@ export type {
   ListBlobsOptions,
   ListBlobsResult,
 } from './bs.js';
+
+// Socket abstractions
+export { PeerSocketMock } from './peer-socket-mock.js';
+export { SocketMock } from './socket-mock.js';
+export type { Socket } from './socket.js';
