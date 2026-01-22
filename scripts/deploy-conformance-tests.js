@@ -113,7 +113,7 @@ async function _copyBsConformanceSetup(targetDir) {
 
   // Update exports of Bs and BsTestSetup
   const content = await fs.readFile(from, 'utf-8');
-  const replacedContent = content.replaceAll(/'...\/src\/?'/g, "'@rljson/bs'");
+  const replacedContent = content.replaceAll(/'..\/src\/?'/g, "'@rljson/bs'");
 
   console.log(gray(`cp ${from} ${to}`));
   await fs.writeFile(to, replacedContent, 'utf-8');
