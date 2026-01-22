@@ -7,6 +7,7 @@
 // Blob Storage
 export { BsMem } from './bs-mem.js';
 export { BsMulti, type BsMultiBs } from './bs-multi.js';
+export { BsPeerBridge } from './bs-peer-bridge.js';
 export { BsPeer } from './bs-peer.js';
 export { BsServer } from './bs-server.js';
 export type { BsTestSetup } from './bs-test-setup.js';
