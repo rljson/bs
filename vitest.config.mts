@@ -23,7 +23,12 @@ export default defineConfig(({ mode }) => {
         provider: 'v8', // "istanbul" or "v8"
         reporter: ['text', 'json', 'html'],
         include: ['src/**/*.ts'],
-        exclude: ['src/index.ts'],
+        exclude: [
+          'src/index.ts',
+          'src/bs.ts', // Interface definitions only
+          'src/bs-test-setup.ts', // Interface definitions only
+          'src/socket.ts', // Contains example code only
+        ],
         all: true,
         thresholds: {
           statements: 100,
