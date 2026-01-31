@@ -16,16 +16,21 @@ import type { Socket } from './socket.js';
 export class BsPeerBridge {
   private _eventHandlers: Map<string | symbol, (...args: any[]) => void> =
     new Map();
+  private _handleConnectBound = this._handleConnect.bind(this);
+  private _handleDisconnectBound = this._handleDisconnect.bind(this);
 
-  constructor(private _bs: Bs, private _socket: Socket) {}
+  constructor(
+    private _bs: Bs,
+    private _socket: Socket,
+  ) {}
 
   /**
    * Starts the bridge by setting up connection event handlers and
    * automatically registering all Bs methods.
    */
   start(): void {
-    this._socket.on('connect', () => this._handleConnect());
-    this._socket.on('disconnect', () => this._handleDisconnect());
+    this._socket.on('connect', this._handleConnectBound);
+    this._socket.on('disconnect', this._handleDisconnectBound);
 
     // Automatically register all Bs interface methods
     this._registerBsMethods();
@@ -35,10 +40,8 @@ export class BsPeerBridge {
    * Stops the bridge by removing all event handlers.
    */
   stop(): void {
-    /* v8 ignore next -- @preserve */
-    this._socket.off('connect', () => this._handleConnect());
-    /* v8 ignore next -- @preserve */
-    this._socket.off('disconnect', () => this._handleDisconnect());
+    this._socket.off('connect', this._handleConnectBound);
+    this._socket.off('disconnect', this._handleDisconnectBound);
 
     for (const [eventName, handler] of this._eventHandlers) {
       this._socket.off(eventName, handler);
@@ -50,16 +53,14 @@ export class BsPeerBridge {
    * Automatically registers all Bs interface methods as socket event handlers.
    */
   private _registerBsMethods(): void {
-    // Core Bs interface methods
+    // Core Bs interface methods (read-only for PULL architecture)
+    // Only register read operations to match IoPeerBridge pattern
     const bsMethods = [
-      'setBlob',
       'getBlob',
       'getBlobStream',
-      'deleteBlob',
       'blobExists',
       'getBlobProperties',
       'listBlobs',
-      'generateSignedUrl',
     ];
 
     for (const methodName of bsMethods) {
@@ -90,7 +91,7 @@ export class BsPeerBridge {
           `Method "${methodName}" not found on Bs instance`,
         );
         if (typeof callback === 'function') {
-          callback(null, error);
+          callback(error, null);
         }
         return;
       }
@@ -101,14 +102,14 @@ export class BsPeerBridge {
         .apply(this._bs, methodArgs)
         .then((result: any) => {
           if (typeof callback === 'function') {
-            // Call callback with just the result (no error parameter when successful)
-            callback(result, null); // Two arguments
+            // Node.js style: error-first callback (error, result)
+            callback(null, result); // Two arguments
           }
         })
         .catch((error: any) => {
           if (typeof callback === 'function') {
-            // For errors, send null as result and error as second parameter
-            callback(null, error); // Two arguments
+            // Node.js style: error-first callback (error, result)
+            callback(error, null); // Two arguments
           }
         });
     };
@@ -167,9 +168,9 @@ export class BsPeerBridge {
       }
 
       const result = await bsMethod.apply(this._bs, args);
-      this._socket.emit(socketEventName, result, null);
+      this._socket.emit(socketEventName, null, result);
     } catch (error) {
-      this._socket.emit(socketEventName, null, error);
+      this._socket.emit(socketEventName, error, null);
     }
   }
 

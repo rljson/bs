@@ -22,4 +22,5 @@ export type {
 // Socket abstractions
 export { PeerSocketMock } from './peer-socket-mock.js';
 export { SocketMock } from './socket-mock.js';
+export { createSocketPair } from './directional-socket-mock.js';
 export type { Socket } from './socket.js';

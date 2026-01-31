@@ -28,6 +28,7 @@ export default defineConfig(({ mode }) => {
           'src/bs.ts', // Interface definitions only
           'src/bs-test-setup.ts', // Interface definitions only
           'src/socket.ts', // Contains example code only
+          'src/directional-socket-mock.ts', // Mock for testing only
         ],
         all: true,
         thresholds: {
