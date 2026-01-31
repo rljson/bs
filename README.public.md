@@ -1,6 +1,6 @@
 <!--
 @license
-Copyright (c) 2025 Rljson
+Copyright (c) 2026 Rljson
 
 Use of this source code is governed by terms that can be
 found in the LICENSE file in the root of this package.
@@ -8,19 +8,20 @@ found in the LICENSE file in the root of this package.
 
 # @rljson/bs
 
-Content-addressable blob storage interface and implementations for rljson.
+Content-addressable blob storage interface and implementations for TypeScript/JavaScript.
 
 ## Overview
 
-`@rljson/bs` provides a unified interface for blob storage with content-addressable semantics. All blobs are identified by their SHA256 hash, ensuring automatic deduplication and data integrity.
+`@rljson/bs` provides a unified interface for blob storage with content-addressable semantics. All blobs are identified by their SHA256 hash, ensuring automatic deduplication, data integrity verification, and location independence.
 
 ### Key Features
 
 - **Content-Addressable Storage**: Blobs are identified by SHA256 hash of their content
-- **Automatic Deduplication**: Identical content is stored only once
+- **Automatic Deduplication**: Identical content is stored only once across the entire system
 - **Multiple Implementations**: In-memory, peer-to-peer, server-based, and multi-tier
 - **Type-Safe**: Full TypeScript support with comprehensive type definitions
 - **Stream Support**: Efficient handling of large blobs via ReadableStreams
+- **Network Layer**: Built-in peer-to-peer and client-server implementations
 - **100% Test Coverage**: Fully tested with comprehensive test suite
 
 ## Installation
@@ -31,7 +32,7 @@ npm install @rljson/bs
 
 ## Quick Start
 
-### In-Memory Storage
+### Basic Usage: In-Memory Storage
 
 The simplest implementation for testing or temporary storage:
 
@@ -42,8 +43,9 @@ import { BsMem } from '@rljson/bs';
 const bs = new BsMem();
 
 // Store a blob - returns SHA256 hash as blobId
-const { blobId } = await bs.setBlob('Hello, World!');
-console.log(blobId); // e.g., "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f"
+const { blobId, size } = await bs.setBlob('Hello, World!');
+console.log(blobId); // "dffd6021bb2bd5b0af676290809ec3a53191dd81c7f70a4b28688a362182986f"
+console.log(size);   // 13
 
 // Retrieve the blob
 const { content } = await bs.getBlob(blobId);
@@ -53,9 +55,39 @@ console.log(content.toString()); // "Hello, World!"
 const exists = await bs.blobExists(blobId);
 console.log(exists); // true
 
+// Get blob properties without downloading
+const props = await bs.getBlobProperties(blobId);
+console.log(props.createdAt); // Timestamp
+
 // List all blobs
 const { blobs } = await bs.listBlobs();
 console.log(blobs.length); // 1
+```
+
+### Client-Server Architecture
+
+Access remote blob storage over a socket connection:
+
+```typescript
+import { BsMem, BsServer, BsPeer, SocketMock } from '@rljson/bs';
+
+// Server setup
+const storage = new BsMem();
+const server = new BsServer(storage);
+
+// Client setup
+const socket = new SocketMock(); // Use real socket in production
+await server.addSocket(socket);
+const client = new BsPeer(socket);
+await client.init();
+
+// Client can now access server storage
+const { blobId } = await client.setBlob('Remote data');
+const { content } = await client.getBlob(blobId);
+console.log(content.toString()); // "Remote data"
+
+// Close connection
+await client.close();
 ```
 
 ### Multi-Tier Storage (Cache + Remote)
@@ -63,16 +95,14 @@ console.log(blobs.length); // 1
 Combine multiple storage backends with automatic caching:
 
 ```typescript
-import { BsMulti, BsMem, BsPeer, PeerSocketMock } from '@rljson/bs';
-
-// Setup remote storage (simulated)
-const remoteStore = new BsMem();
-const remoteSocket = new PeerSocketMock(remoteStore);
-const remotePeer = new BsPeer(remoteSocket);
-await remotePeer.init();
+import { BsMulti, BsMem, BsPeer } from '@rljson/bs';
 
 // Setup local cache
 const localCache = new BsMem();
+
+// Setup remote storage (via BsPeer)
+const remotePeer = new BsPeer(remoteSocket);
+await remotePeer.init();
 
 // Create multi-tier storage with cache-first strategy
 const bs = new BsMulti([
@@ -84,8 +114,8 @@ await bs.init();
 // Store blob - writes to cache only (writable stores)
 const { blobId } = await bs.setBlob('Cached content');
 
-// Read from cache first, falls back to remote
-// Automatically hot-swaps remote blobs to cache
+// Read from cache first, falls back to remote if not found
+// Automatically hot-swaps remote blobs to cache for future reads
 const { content } = await bs.getBlob(blobId);
 ```
 
@@ -93,11 +123,7 @@ const { content } = await bs.getBlob(blobId);
 
 ### Content-Addressable Storage
 
-Every blob is identified by the SHA256 hash of its content. This means:
-
-- **Automatic Deduplication**: Storing the same content twice returns the same `blobId`
-- **Data Integrity**: The `blobId` serves as a cryptographic checksum
-- **Location Independence**: Blobs can be identified and verified anywhere
+Every blob is identified by the SHA256 hash of its content:
 
 ```typescript
 const bs = new BsMem();
@@ -105,9 +131,20 @@ const bs = new BsMem();
 const result1 = await bs.setBlob('Same content');
 const result2 = await bs.setBlob('Same content');
 
-// Both return the same blobId
+// Both return the same blobId (automatic deduplication)
 console.log(result1.blobId === result2.blobId); // true
+
+// Different content = different blobId
+const result3 = await bs.setBlob('Different content');
+console.log(result1.blobId !== result3.blobId); // true
 ```
+
+**Benefits:**
+
+- **Automatic Deduplication**: Identical content stored once, regardless of how many times you call `setBlob`
+- **Data Integrity**: The `blobId` serves as a cryptographic checksum
+- **Location Independence**: Blobs can be identified and verified anywhere
+- **Cache Efficiency**: Content can be cached anywhere and verified by its hash
 
 ### Blob Properties
 
@@ -115,122 +152,11 @@ All blobs have associated metadata:
 
 ```typescript
 interface BlobProperties {
-  blobId: string;      // SHA256 hash of content
+  blobId: string;      // SHA256 hash of content (64 hex characters)
   size: number;        // Size in bytes
-  contentType: string; // MIME type (default: 'application/octet-stream')
   createdAt: Date;     // Creation timestamp
-  metadata?: Record<string, string>; // Optional custom metadata
 }
 ```
-
-## Implementations
-
-### BsMem - In-Memory Storage
-
-Fast, ephemeral storage for testing and temporary data:
-
-```typescript
-import { BsMem } from '@rljson/bs';
-
-const bs = new BsMem();
-const { blobId } = await bs.setBlob('Temporary data');
-```
-
-**Use Cases:**
-
-- Unit testing
-- Temporary caching
-- Development and prototyping
-
-**Limitations:**
-
-- Data lost when process ends
-- Limited by available RAM
-
-### BsPeer - Peer-to-Peer Storage
-
-Access remote blob storage over a socket connection:
-
-```typescript
-import { BsPeer, PeerSocketMock } from '@rljson/bs';
-
-// Create a peer connected to a remote storage
-const remoteStorage = new BsMem();
-const socket = new PeerSocketMock(remoteStorage);
-const peer = new BsPeer(socket);
-await peer.init();
-
-// Use like any other Bs implementation
-const { blobId } = await peer.setBlob('Remote data');
-const { content } = await peer.getBlob(blobId);
-
-// Close connection when done
-await peer.close();
-```
-
-**Use Cases:**
-
-- Distributed systems
-- Client-server architectures
-- Remote backup
-
-### BsServer - Server-Side Handler
-
-Handle blob storage requests from remote peers:
-
-```typescript
-import { BsServer, BsMem, SocketMock } from '@rljson/bs';
-
-// Server-side setup
-const storage = new BsMem();
-const server = new BsServer(storage);
-
-// Handle incoming connection
-const clientSocket = new SocketMock();
-const serverSocket = clientSocket.createPeer();
-server.handleConnection(serverSocket);
-
-// Client can now access storage through clientSocket
-```
-
-**Use Cases:**
-
-- Building blob storage services
-- Network protocol implementation
-- API backends
-
-### BsMulti - Multi-Tier Storage
-
-Combine multiple storage backends with configurable priorities:
-
-```typescript
-import { BsMulti, BsMem } from '@rljson/bs';
-
-const fastCache = new BsMem();
-const mainStorage = new BsMem();
-const backup = new BsMem();
-
-const bs = new BsMulti([
-  { bs: fastCache, priority: 0, read: true, write: true },   // L1 cache
-  { bs: mainStorage, priority: 1, read: true, write: true }, // Main storage
-  { bs: backup, priority: 2, read: true, write: false },     // Read-only backup
-]);
-await bs.init();
-```
-
-**Features:**
-
-- **Priority-Based Reads**: Reads from lowest priority number first
-- **Hot-Swapping**: Automatically caches blobs from remote to local
-- **Parallel Writes**: Writes to all writable stores simultaneously
-- **Deduplication**: Merges results from all readable stores
-
-**Use Cases:**
-
-- Local cache + remote storage
-- Local network storage infrastructure
-- Backup and archival systems
-- Distributed blob storage across network nodes
 
 ## API Reference
 
@@ -247,10 +173,10 @@ Stores a blob and returns its properties including the SHA256 `blobId`.
 const { blobId } = await bs.setBlob('Hello');
 
 // From Buffer
-const buffer = Buffer.from('World');
+const buffer = Buffer.from('World', 'utf8');
 await bs.setBlob(buffer);
 
-// From ReadableStream
+// From ReadableStream (for large files)
 const stream = new ReadableStream({
   start(controller) {
     controller.enqueue(new TextEncoder().encode('Stream data'));
@@ -297,13 +223,14 @@ Deletes a blob from storage.
 
 ```typescript
 await bs.deleteBlob(blobId);
-```
 
-**Note:** In production systems with content-addressable storage, consider implementing reference counting before deletion.
+// Note: In production with content-addressable storage,
+// consider reference counting before deletion
+```
 
 #### `blobExists(blobId: string): Promise<boolean>`
 
-Checks if a blob exists.
+Checks if a blob exists without downloading it.
 
 ```typescript
 if (await bs.blobExists(blobId)) {
@@ -318,7 +245,7 @@ Gets blob metadata without downloading content.
 ```typescript
 const props = await bs.getBlobProperties(blobId);
 console.log(`Blob size: ${props.size} bytes`);
-console.log(`Created: ${props.createdAt}`);
+console.log(`Created: ${props.createdAt.toISOString()}`);
 ```
 
 #### `listBlobs(options?: ListBlobsOptions): Promise<ListBlobsResult>`
@@ -329,7 +256,7 @@ Lists all blobs with optional filtering and pagination.
 // List all blobs
 const { blobs } = await bs.listBlobs();
 
-// With prefix filter
+// With prefix filter (blobs starting with "abc")
 const result = await bs.listBlobs({ prefix: 'abc' });
 
 // Paginated listing
@@ -350,56 +277,202 @@ do {
 Generates a signed URL for temporary access to a blob.
 
 ```typescript
-// Read-only URL valid for 1 hour
+// Read-only URL valid for 1 hour (3600 seconds)
 const url = await bs.generateSignedUrl(blobId, 3600);
 
-// Delete permission URL
+// Delete permission URL valid for 5 minutes
 const deleteUrl = await bs.generateSignedUrl(blobId, 300, 'delete');
 ```
 
-## Advanced Usage
+## Implementations
 
-### Custom Storage Implementation
+### BsMem - In-Memory Storage
 
-Implement the `Bs` interface to create custom storage backends:
+Fast, ephemeral storage for testing and temporary data.
 
 ```typescript
-import { Bs, BlobProperties } from '@rljson/bs';
+import { BsMem } from '@rljson/bs';
 
-class MyCustomStorage implements Bs {
-  async setBlob(content: Buffer | string | ReadableStream): Promise<BlobProperties> {
-    // Your implementation
-  }
-
-  async getBlob(blobId: string) {
-    // Your implementation
-  }
-
-  // Implement other methods...
-}
+const bs = new BsMem();
+const { blobId } = await bs.setBlob('Temporary data');
 ```
 
-### Multi-Tier Patterns
+**Use Cases:**
 
-**Local Cache + Remote Storage:**
+- Unit testing
+- Temporary caching
+- Development and prototyping
+- Fast local storage for small datasets
+
+**Limitations:**
+
+- Data lost when process ends
+- Limited by available RAM
+- Single-process only
+
+### BsPeer - Peer-to-Peer Storage Client
+
+Access remote blob storage over a socket connection.
 
 ```typescript
+import { BsPeer } from '@rljson/bs';
+
+// Create a peer connected to a remote storage
+const peer = new BsPeer(socket);
+await peer.init();
+
+// Use like any other Bs implementation
+const { blobId } = await peer.setBlob('Remote data');
+const { content } = await peer.getBlob(blobId);
+
+// Close connection when done
+await peer.close();
+```
+
+**Use Cases:**
+
+- Client-server architectures
+- Distributed systems
+- Remote backup
+- Accessing centralized storage
+
+**Features:**
+
+- Async socket-based communication
+- Error-first callback pattern (Node.js style)
+- Connection state management
+- Automatic retry support
+
+### BsServer - Server-Side Handler
+
+Handle blob storage requests from remote peers.
+
+```typescript
+import { BsServer, BsMem, SocketMock } from '@rljson/bs';
+
+// Server-side setup
+const storage = new BsMem();
+const server = new BsServer(storage);
+
+// Handle incoming connection
+const clientSocket = new SocketMock(); // Use real socket in production
+await server.addSocket(clientSocket);
+
+// Client can now access storage through socket
+```
+
+**Use Cases:**
+
+- Building blob storage services
+- Network protocol implementation
+- API backends
+- Multi-client storage systems
+
+**Features:**
+
+- Multiple client support
+- Socket lifecycle management
+- Automatic method mapping
+- Error handling
+
+### BsPeerBridge - PULL Architecture Bridge (Read-Only)
+
+Exposes local blob storage for server to PULL from (read-only access).
+
+```typescript
+import { BsPeerBridge, BsMem } from '@rljson/bs';
+
+// Client-side: expose local storage for server to read
+const localStorage = new BsMem();
+const bridge = new BsPeerBridge(localStorage, socket);
+bridge.start();
+
+// Server can now read from client's local storage
+// but CANNOT write to it (PULL architecture)
+```
+
+**Architecture Pattern:**
+
+- **PULL-only**: Server can read from client, but cannot write
+- **Read Operations Only**: `getBlob`, `getBlobStream`, `blobExists`, `getBlobProperties`, `listBlobs`
+- **No Write Operations**: Does not expose `setBlob`, `deleteBlob`, or `generateSignedUrl`
+
+**Use Cases:**
+
+- Client exposes local cache for server to access
+- Distributed storage where server pulls from clients
+- Peer-to-peer networks with read-only sharing
+
+### BsMulti - Multi-Tier Storage
+
+Combine multiple storage backends with configurable priorities.
+
+```typescript
+import { BsMulti, BsMem } from '@rljson/bs';
+
+const fastCache = new BsMem();
+const mainStorage = new BsMem();
+const backup = new BsMem();
+
+const bs = new BsMulti([
+  { bs: fastCache, priority: 0, read: true, write: true },   // L1 cache
+  { bs: mainStorage, priority: 1, read: true, write: true }, // Main storage
+  { bs: backup, priority: 2, read: true, write: false },     // Read-only backup
+]);
+await bs.init();
+```
+
+**Features:**
+
+- **Priority-Based Reads**: Reads from lowest priority number first (0 = highest priority)
+- **Hot-Swapping**: Automatically caches blobs from remote to local on read
+- **Parallel Writes**: Writes to all writable stores simultaneously
+- **Deduplication**: Merges results from all readable stores when listing
+- **Graceful Fallback**: If highest priority fails, falls back to next priority
+
+**Use Cases:**
+
+- Local cache + remote storage
+- Multi-region storage replication
+- Local network storage infrastructure
+- Backup and archival systems
+- Hierarchical storage management (HSM)
+
+## Common Patterns
+
+### Local Cache + Remote Storage (PULL Architecture)
+
+```typescript
+const localCache = new BsMem();
+const remotePeer = new BsPeer(remoteSocket);
+await remotePeer.init();
+
 const bs = new BsMulti([
   { bs: localCache, priority: 0, read: true, write: true },
-  { bs: remoteStorage, priority: 1, read: true, write: false },
+  { bs: remotePeer, priority: 1, read: true, write: false }, // Read-only
 ]);
+
+// Writes go to cache only
+await bs.setBlob('data');
+
+// Reads check cache first, then remote
+// Remote blobs are automatically cached
+const { content } = await bs.getBlob(blobId);
 ```
 
-**Write-Through Cache:**
+### Write-Through Cache
 
 ```typescript
 const bs = new BsMulti([
   { bs: localCache, priority: 0, read: true, write: true },
   { bs: remoteStorage, priority: 1, read: true, write: true }, // Also writable
 ]);
+
+// Writes go to both cache and remote simultaneously
+await bs.setBlob('data');
 ```
 
-**Multi-Region Replication:**
+### Multi-Region Replication
 
 ```typescript
 const bs = new BsMulti([
@@ -407,9 +480,32 @@ const bs = new BsMulti([
   { bs: regionEu, priority: 1, read: true, write: true },
   { bs: regionAsia, priority: 2, read: true, write: true },
 ]);
+
+// Writes replicate to all regions
+// Reads come from fastest responding region
 ```
 
-### Error Handling
+### Client-Server with BsPeerBridge (PULL Pattern)
+
+```typescript
+// Client setup
+const clientStorage = new BsMem();
+const bridge = new BsPeerBridge(clientStorage, socketToServer);
+bridge.start(); // Exposes read-only access to server
+
+const bsPeer = new BsPeer(socketToServer);
+await bsPeer.init();
+
+const clientBs = new BsMulti([
+  { bs: clientStorage, priority: 0, read: true, write: true }, // Local storage
+  { bs: bsPeer, priority: 1, read: true, write: false },       // Server (read-only)
+]);
+
+// Server can pull from client via bridge
+// Client can pull from server via bsPeer
+```
+
+## Error Handling
 
 All methods throw errors for invalid operations:
 
@@ -436,6 +532,7 @@ The package includes comprehensive test utilities:
 
 ```typescript
 import { BsMem } from '@rljson/bs';
+import { describe, it, expect, beforeEach } from 'vitest';
 
 describe('My Tests', () => {
   let bs: BsMem;
@@ -449,6 +546,12 @@ describe('My Tests', () => {
     const { content } = await bs.getBlob(blobId);
     expect(content.toString()).toBe('test data');
   });
+
+  it('should deduplicate identical content', async () => {
+    const result1 = await bs.setBlob('same');
+    const result2 = await bs.setBlob('same');
+    expect(result1.blobId).toBe(result2.blobId);
+  });
 });
 ```
 
@@ -458,21 +561,72 @@ describe('My Tests', () => {
 
 - `BsMem` stores all data in RAM - suitable for small to medium datasets
 - Use streams (`getBlobStream`) for large blobs to avoid loading entire content into memory
-- `BsMulti` with local cache reduces network overhead
+- `BsMulti` with local cache reduces network overhead significantly
 
 ### Network Efficiency
 
 - Use `BsPeer` for remote access with minimal protocol overhead
-- `BsMulti` automatically caches frequently accessed blobs
-- Content-addressable nature prevents redundant transfers
+- `BsMulti` automatically caches frequently accessed blobs locally
+- Content-addressable nature prevents redundant transfers (same content = same hash)
+- Hot-swapping in `BsMulti` reduces repeated network requests
 
-### Deduplication
+### Deduplication Benefits
 
 - Identical content stored multiple times occupies space only once
 - Particularly effective for:
-  - Version control systems
-  - Backup solutions
-  - Build artifact storage
+  - Version control systems (many files unchanged between versions)
+  - Backup solutions (incremental backups with deduplication)
+  - Build artifact storage (shared dependencies)
+  - Document management (attachments, templates)
+
+## Migration Guide
+
+### From Traditional Blob Storage
+
+Traditional blob storage typically uses arbitrary identifiers:
+
+```typescript
+// Traditional
+await blobStore.put('my-file-id', content);
+const data = await blobStore.get('my-file-id');
+```
+
+With content-addressable storage, the ID is derived from content:
+
+```typescript
+// Content-addressable
+const { blobId } = await bs.setBlob(content); // blobId = SHA256(content)
+const { content } = await bs.getBlob(blobId);
+```
+
+**Key Differences:**
+
+1. **No custom IDs**: You cannot choose blob IDs, they are computed
+2. **Automatic deduplication**: Same content = same ID
+3. **Verify on read**: You can verify content integrity by recomputing the hash
+4. **External metadata**: Store file names, tags, etc. separately (e.g., in @rljson/io)
+
+## Frequently Asked Questions
+
+### Q: How do I organize blobs into folders or containers?
+
+A: The Bs interface provides a flat storage pool. Organizational metadata (folders, tags, file names) should be stored separately, such as in a database or using `@rljson/io` (data table storage). Reference blobs by their `blobId`.
+
+### Q: What happens if I delete a blob that's referenced elsewhere?
+
+A: The blob is permanently deleted. In production systems with shared blobs, implement reference counting before deletion.
+
+### Q: Can I use this in the browser?
+
+A: Yes, but you'll need to provide your own Socket implementation for network communication, or use `BsMem` for local-only storage.
+
+### Q: How does BsMulti handle write conflicts?
+
+A: `BsMulti` writes to all writable stores in parallel. If any write fails, the error is thrown. All writable stores will have the blob since content is identical (content-addressable).
+
+### Q: Why is BsPeerBridge read-only?
+
+A: BsPeerBridge implements the PULL architecture pattern, where the server can read from client storage but cannot modify it. This prevents the server from pushing unwanted data to clients. Use BsPeer for client-to-server writes.
 
 ## License
 
@@ -485,3 +639,4 @@ Issues and pull requests welcome at <https://github.com/rljson/bs>
 ## Related Packages
 
 - `@rljson/io` - Data table storage interface and implementations
+- `@rljson/hash` - Cryptographic hashing utilities
