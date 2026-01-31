@@ -1,6 +1,6 @@
 {
   "name": "@rljson/bs",
-  "version": "0.0.19",
+  "version": "0.0.20",
   "description": "Blob storage interface and implementations for rljson",
   "homepage": "https://github.com/rljson/bs",
   "bugs": "https://github.com/rljson/bs/issues",
