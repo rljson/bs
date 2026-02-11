@@ -108,7 +108,7 @@ export class BsMulti implements Bs {
 
     if (!result) {
       // Blob not found in any readable
-      /* v8 ignore next 2 -- @preserve */
+      /* v8 ignore next -- @preserve */
       const notFoundErrors = errors.filter((err) =>
         err.message.includes('Blob not found'),
       );
@@ -121,10 +121,11 @@ export class BsMulti implements Bs {
 
     // Hot-swap: write blob to all writables (except source) for caching
     if (this.writables.length > 0) {
-      /* v8 ignore next 3 -- @preserve */
+      /* v8 ignore start -- @preserve */
       const hotSwapWrites = this.writables
         .filter((writable) => writable.id !== readFrom)
         .map(({ bs }) => bs.setBlob(result!.content).catch(() => {})); // Ignore cache write errors
+      /* v8 ignore stop -- @preserve */
 
       await Promise.all(hotSwapWrites);
     }
@@ -156,7 +157,7 @@ export class BsMulti implements Bs {
     }
 
     // Blob not found in any readable
-    /* v8 ignore next 2 -- @preserve */
+    /* v8 ignore next -- @preserve */
     const notFoundErrors = errors.filter((err) =>
       err.message.includes('Blob not found'),
     );
@@ -233,7 +234,7 @@ export class BsMulti implements Bs {
     }
 
     // Blob not found in any readable
-    /* v8 ignore next 2 -- @preserve */
+    /* v8 ignore next -- @preserve */
     const notFoundErrors = errors.filter((err) =>
       err.message.includes('Blob not found'),
     );
@@ -294,7 +295,7 @@ export class BsMulti implements Bs {
     let startIndex = 0;
 
     if (options?.continuationToken) {
-      /* v8 ignore next 2 -- @preserve */
+      /* v8 ignore next -- @preserve */
       const tokenIndex = blobs.findIndex(
         (blob) => blob.blobId === options.continuationToken,
       );
@@ -349,7 +350,7 @@ export class BsMulti implements Bs {
     }
 
     // Blob not found in any readable
-    /* v8 ignore next 2 -- @preserve */
+    /* v8 ignore next -- @preserve */
     const notFoundErrors = errors.filter((err) =>
       err.message.includes('Blob not found'),
     );
@@ -365,7 +366,7 @@ export class BsMulti implements Bs {
    * Gets the list of underlying readable Bs instances, sorted by priority.
    */
   get readables(): Array<BsMultiBs> {
-    /* v8 ignore next 2 -- @preserve */
+    /* v8 ignore next -- @preserve */
     return this._stores
       .filter((store) => store.read)
       .sort((a, b) => a.priority - b.priority);
@@ -376,7 +377,7 @@ export class BsMulti implements Bs {
    * Gets the list of underlying writable Bs instances, sorted by priority.
    */
   get writables(): Array<BsMultiBs> {
-    /* v8 ignore next 2 -- @preserve */
+    /* v8 ignore next -- @preserve */
     return this._stores
       .filter((store) => store.write)
       .sort((a, b) => a.priority - b.priority);
