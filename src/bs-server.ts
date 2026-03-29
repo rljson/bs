@@ -14,7 +14,7 @@ import { Socket } from './socket.ts';
 export class BsServer {
   private _sockets: Socket[] = [];
 
-  constructor(private readonly _bs: Bs) {}
+  constructor(private _bs: Bs) {}
 
   // ...........................................................................
   /**
@@ -44,8 +44,8 @@ export class BsServer {
    * @param socket - The socket to add the transport layer to.
    */
   private async _addTransportLayer(socket: Socket): Promise<void> {
-    const methods = this._generateTransportLayer(this._bs);
-    for (const [key, fn] of Object.entries(methods)) {
+    const crud = this._generateTransportLayerCRUD();
+    for (const [key, fn] of Object.entries(crud)) {
       socket.on(key, (...args: unknown[]) => {
         const cb = args[args.length - 1] as (
           error: Error | null,
@@ -65,25 +65,27 @@ export class BsServer {
 
   // ...........................................................................
   /**
-   * Generates a transport layer object for the given Bs instance.
-   * @param bs - The Bs instance to generate the transport layer for.
-   * @returns An object containing methods that correspond to the Bs interface.
+   * Generates a transport layer object that always delegates to the current
+   * this._bs. Each method is an arrow function reading this._bs at call
+   * time so that external code can replace _bs after construction and all
+   * existing socket handlers pick up the new instance.
    */
-  private _generateTransportLayer = (bs: Bs) =>
+  private _generateTransportLayerCRUD = () =>
     ({
       setBlob: (content: Buffer | string | ReadableStream) =>
-        bs.setBlob(content),
+        this._bs.setBlob(content),
       getBlob: (blobId: string, options?: DownloadBlobOptions) =>
-        bs.getBlob(blobId, options),
-      getBlobStream: (blobId: string) => bs.getBlobStream(blobId),
-      deleteBlob: (blobId: string) => bs.deleteBlob(blobId),
-      blobExists: (blobId: string) => bs.blobExists(blobId),
-      getBlobProperties: (blobId: string) => bs.getBlobProperties(blobId),
-      listBlobs: (options?: ListBlobsOptions) => bs.listBlobs(options),
+        this._bs.getBlob(blobId, options),
+      getBlobStream: (blobId: string) => this._bs.getBlobStream(blobId),
+      deleteBlob: (blobId: string) => this._bs.deleteBlob(blobId),
+      blobExists: (blobId: string) => this._bs.blobExists(blobId),
+      getBlobProperties: (blobId: string) =>
+        this._bs.getBlobProperties(blobId),
+      listBlobs: (options?: ListBlobsOptions) => this._bs.listBlobs(options),
       generateSignedUrl: (
         blobId: string,
         expiresIn: number,
         permissions?: 'read' | 'delete',
-      ) => bs.generateSignedUrl(blobId, expiresIn, permissions),
+      ) => this._bs.generateSignedUrl(blobId, expiresIn, permissions),
     } as { [key: string]: (...args: unknown[]) => Promise<unknown> });
 }
