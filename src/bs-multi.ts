@@ -54,6 +54,18 @@ export class BsMulti implements Bs {
 
   // ...........................................................................
   /**
+   * Checks whether a Bs instance is a known-closed peer connection. Only
+   * instances exposing an `isOpen` flag (e.g. BsPeer) can be closed;
+   * instances without one (e.g. BsMem) are always treated as open.
+   * @param bs - The Bs instance to check
+   * @returns True if the instance exposes `isOpen === false`
+   */
+  private _isClosed(bs: Bs): boolean {
+    return (bs as { isOpen?: boolean }).isOpen === false;
+  }
+
+  // ...........................................................................
+  /**
    * Stores a blob in all writable Bs instances in parallel.
    * @param content - The blob content to store
    * @returns Promise resolving to blob properties from the first successful write
@@ -93,9 +105,14 @@ export class BsMulti implements Bs {
     let result: { content: Buffer; properties: BlobProperties } | undefined;
     let readFrom: string = '';
     const errors: Error[] = [];
+    let allClosed = true;
 
     // Try readables in priority order
     for (const readable of this.readables) {
+      if (this._isClosed(readable.bs)) {
+        continue; // Skip known-closed peers instead of hanging on them
+      }
+      allClosed = false;
       try {
         result = await readable.bs.getBlob(blobId, options);
         readFrom = readable.id ?? '';
@@ -107,6 +124,12 @@ export class BsMulti implements Bs {
     }
 
     if (!result) {
+      if (allClosed) {
+        // No member was ever queried — this is a topology failure, not a
+        // verified absence, so it must not look like "Blob not found".
+        throw new Error('All readable Bs instances are closed');
+      }
+
       // Blob not found in any readable
       /* v8 ignore next -- @preserve */
       const notFoundErrors = errors.filter((err) =>
@@ -145,15 +168,24 @@ export class BsMulti implements Bs {
     }
 
     const errors: Error[] = [];
+    let allClosed = true;
 
     // Try readables in priority order
     for (const readable of this.readables) {
+      if (this._isClosed(readable.bs)) {
+        continue; // Skip known-closed peers instead of hanging on them
+      }
+      allClosed = false;
       try {
         return await readable.bs.getBlobStream(blobId);
       } catch (e) {
         errors.push(e as Error);
         continue;
       }
+    }
+
+    if (allClosed) {
+      throw new Error('All readable Bs instances are closed');
     }
 
     // Blob not found in any readable
@@ -196,7 +228,12 @@ export class BsMulti implements Bs {
     }
 
     // Check readables in priority order
+    let allClosed = true;
     for (const readable of this.readables) {
+      if (this._isClosed(readable.bs)) {
+        continue; // Skip known-closed peers instead of hanging on them
+      }
+      allClosed = false;
       try {
         const exists = await readable.bs.blobExists(blobId);
         if (exists) {
@@ -205,6 +242,12 @@ export class BsMulti implements Bs {
       } catch {
         continue;
       }
+    }
+
+    if (allClosed) {
+      // No member was ever queried — this is a topology failure, so
+      // returning `false` (a verified absence) would be misleading.
+      throw new Error('All readable Bs instances are closed');
     }
 
     return false;
@@ -222,15 +265,24 @@ export class BsMulti implements Bs {
     }
 
     const errors: Error[] = [];
+    let allClosed = true;
 
     // Try readables in priority order
     for (const readable of this.readables) {
+      if (this._isClosed(readable.bs)) {
+        continue; // Skip known-closed peers instead of hanging on them
+      }
+      allClosed = false;
       try {
         return await readable.bs.getBlobProperties(blobId);
       } catch (e) {
         errors.push(e as Error);
         continue;
       }
+    }
+
+    if (allClosed) {
+      throw new Error('All readable Bs instances are closed');
     }
 
     // Blob not found in any readable
@@ -258,9 +310,14 @@ export class BsMulti implements Bs {
     }
 
     const blobMap = new Map<string, BlobProperties>();
+    let allClosed = true;
 
     // Collect ALL blobs from all readables (no pagination during collection)
     for (const readable of this.readables) {
+      if (this._isClosed(readable.bs)) {
+        continue; // Skip known-closed peers instead of hanging on them
+      }
+      allClosed = false;
       try {
         let continuationToken: string | undefined;
         do {
@@ -281,6 +338,12 @@ export class BsMulti implements Bs {
       } catch {
         continue; // Skip stores that error
       }
+    }
+
+    if (allClosed) {
+      // No member was ever queried — this is a topology failure, not an
+      // empty inventory, so it must not silently look like "no blobs".
+      throw new Error('All readable Bs instances are closed');
     }
 
     // Now apply pagination to merged results
@@ -334,9 +397,14 @@ export class BsMulti implements Bs {
     }
 
     const errors: Error[] = [];
+    let allClosed = true;
 
     // Try readables in priority order
     for (const readable of this.readables) {
+      if (this._isClosed(readable.bs)) {
+        continue; // Skip known-closed peers instead of hanging on them
+      }
+      allClosed = false;
       try {
         return await readable.bs.generateSignedUrl(
           blobId,
@@ -347,6 +415,10 @@ export class BsMulti implements Bs {
         errors.push(e as Error);
         continue;
       }
+    }
+
+    if (allClosed) {
+      throw new Error('All readable Bs instances are closed');
     }
 
     // Blob not found in any readable

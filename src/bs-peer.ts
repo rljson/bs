@@ -14,13 +14,68 @@ import {
 import { Socket } from './socket.ts';
 
 /**
+ * Constructor options for BsPeer.
+ */
+export interface BsPeerOptions {
+  /**
+   * Milliseconds to wait for a request ack before rejecting with a timeout
+   * error. Defaults to 30_000. A non-positive value disables the timeout.
+   */
+  requestTimeoutMs?: number;
+}
+
+/**
  * Peer implementation of the Bs interface that communicates over a socket.
  * Allows remote access to a blob storage instance.
  */
 export class BsPeer implements Bs {
   isOpen: boolean = false;
 
-  constructor(private _socket: Socket) {}
+  private readonly _requestTimeoutMs: number;
+
+  constructor(
+    private _socket: Socket,
+    options?: BsPeerOptions,
+  ) {
+    this._requestTimeoutMs = options?.requestTimeoutMs ?? 30_000;
+  }
+
+  // ...........................................................................
+  /**
+   * Wraps a promise with a timeout. If the promise does not settle within
+   * `_requestTimeoutMs`, the returned promise rejects with a timeout error.
+   * Clears the timer on settlement to avoid leaks and unhandled rejections.
+   * @param promise - The promise to guard with a timeout
+   * @param operation - The method name, used in the timeout error message
+   * @returns A promise that rejects if `promise` does not settle in time
+   */
+  private _withTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+    if (this._requestTimeoutMs <= 0) return promise;
+    let timer: ReturnType<typeof setTimeout>;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(
+          new Error(
+            `Timeout after ${this._requestTimeoutMs}ms on '${operation}'`,
+          ),
+        );
+      }, this._requestTimeoutMs);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => {
+      clearTimeout(timer!);
+    });
+  }
+
+  // ...........................................................................
+  /**
+   * Returns a rejected promise with a "socket closed" error, used to fail
+   * requests fast when `isOpen` is already known to be false instead of
+   * emitting them and waiting on a timeout.
+   * @returns A promise that rejects with a "socket closed" error
+   */
+  private _closedError<T>(): Promise<T> {
+    return Promise.reject(new Error('BsPeer: socket closed'));
+  }
 
   // ...........................................................................
   /**
@@ -88,57 +143,62 @@ export class BsPeer implements Bs {
   setBlob(
     content: Buffer | string | ReadableStream<Uint8Array>,
   ): Promise<BlobProperties> {
-    return new Promise((resolve, reject) => {
-      // Convert ReadableStream to Buffer if needed
-      if (content instanceof ReadableStream) {
-        // For streams, we need to read all chunks first
-        const reader = content.getReader();
-        const chunks: Uint8Array[] = [];
+    if (!this.isOpen) return this._closedError();
 
-        const readStream = async () => {
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              chunks.push(value);
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        // Convert ReadableStream to Buffer if needed
+        if (content instanceof ReadableStream) {
+          // For streams, we need to read all chunks first
+          const reader = content.getReader();
+          const chunks: Uint8Array[] = [];
+
+          const readStream = async () => {
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+              }
+              const totalLength = chunks.reduce(
+                (sum, chunk) => sum + chunk.length,
+                0,
+              );
+              const buffer = Buffer.concat(
+                chunks.map((chunk) => Buffer.from(chunk)),
+                totalLength,
+              );
+
+              // Now emit with the buffer
+              this._socket.emit(
+                'setBlob',
+                buffer,
+                (error: Error | null, result?: BlobProperties) => {
+                  if (error) reject(error);
+                  else resolve(result!);
+                },
+              );
+            } catch (err) {
+              /* v8 ignore next -- @preserve */
+              reject(err);
             }
-            const totalLength = chunks.reduce(
-              (sum, chunk) => sum + chunk.length,
-              0,
-            );
-            const buffer = Buffer.concat(
-              chunks.map((chunk) => Buffer.from(chunk)),
-              totalLength,
-            );
+          };
 
-            // Now emit with the buffer
-            this._socket.emit(
-              'setBlob',
-              buffer,
-              (error: Error | null, result?: BlobProperties) => {
-                if (error) reject(error);
-                else resolve(result!);
-              },
-            );
-          } catch (err) {
-            /* v8 ignore next -- @preserve */
-            reject(err);
-          }
-        };
-
-        readStream();
-      } else {
-        // For Buffer or string, emit directly
-        this._socket.emit(
-          'setBlob',
-          content,
-          (error: Error | null, result?: BlobProperties) => {
-            if (error) reject(error);
-            else resolve(result!);
-          },
-        );
-      }
-    });
+          readStream();
+        } else {
+          // For Buffer or string, emit directly
+          this._socket.emit(
+            'setBlob',
+            content,
+            (error: Error | null, result?: BlobProperties) => {
+              if (error) reject(error);
+              else resolve(result!);
+            },
+          );
+        }
+      }),
+      'setBlob',
+    );
   }
 
   // ...........................................................................
@@ -152,20 +212,25 @@ export class BsPeer implements Bs {
     blobId: string,
     options?: DownloadBlobOptions,
   ): Promise<{ content: Buffer; properties: BlobProperties }> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit(
-        'getBlob',
-        blobId,
-        options,
-        (
-          error: Error | null,
-          result?: { content: Buffer; properties: BlobProperties },
-        ) => {
-          if (error) reject(error);
-          else resolve(result!);
-        },
-      );
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit(
+          'getBlob',
+          blobId,
+          options,
+          (
+            error: Error | null,
+            result?: { content: Buffer; properties: BlobProperties },
+          ) => {
+            if (error) reject(error);
+            else resolve(result!);
+          },
+        );
+      }),
+      'getBlob',
+    );
   }
 
   // ...........................................................................
@@ -175,16 +240,21 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to readable stream
    */
   getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit(
-        'getBlobStream',
-        blobId,
-        (error: Error | null, result?: ReadableStream<Uint8Array>) => {
-          if (error) reject(error);
-          else resolve(result!);
-        },
-      );
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit(
+          'getBlobStream',
+          blobId,
+          (error: Error | null, result?: ReadableStream<Uint8Array>) => {
+            if (error) reject(error);
+            else resolve(result!);
+          },
+        );
+      }),
+      'getBlobStream',
+    );
   }
 
   // ...........................................................................
@@ -194,12 +264,17 @@ export class BsPeer implements Bs {
    * @returns Promise that resolves when deletion is complete
    */
   deleteBlob(blobId: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit('deleteBlob', blobId, (error: Error | null) => {
-        if (error) reject(error);
-        else resolve();
-      });
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit('deleteBlob', blobId, (error: Error | null) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      }),
+      'deleteBlob',
+    );
   }
 
   // ...........................................................................
@@ -209,16 +284,21 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to true if blob exists
    */
   blobExists(blobId: string): Promise<boolean> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit(
-        'blobExists',
-        blobId,
-        (error: Error | null, exists?: boolean) => {
-          if (error) reject(error);
-          else resolve(exists!);
-        },
-      );
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit(
+          'blobExists',
+          blobId,
+          (error: Error | null, exists?: boolean) => {
+            if (error) reject(error);
+            else resolve(exists!);
+          },
+        );
+      }),
+      'blobExists',
+    );
   }
 
   // ...........................................................................
@@ -228,16 +308,21 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to blob properties
    */
   getBlobProperties(blobId: string): Promise<BlobProperties> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit(
-        'getBlobProperties',
-        blobId,
-        (error: Error | null, result?: BlobProperties) => {
-          if (error) reject(error);
-          else resolve(result!);
-        },
-      );
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit(
+          'getBlobProperties',
+          blobId,
+          (error: Error | null, result?: BlobProperties) => {
+            if (error) reject(error);
+            else resolve(result!);
+          },
+        );
+      }),
+      'getBlobProperties',
+    );
   }
 
   // ...........................................................................
@@ -247,16 +332,21 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to list of blobs
    */
   listBlobs(options?: ListBlobsOptions): Promise<ListBlobsResult> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit(
-        'listBlobs',
-        options || {},
-        (error: Error | null, result?: ListBlobsResult) => {
-          if (error) reject(error);
-          else resolve(result!);
-        },
-      );
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit(
+          'listBlobs',
+          options || {},
+          (error: Error | null, result?: ListBlobsResult) => {
+            if (error) reject(error);
+            else resolve(result!);
+          },
+        );
+      }),
+      'listBlobs',
+    );
   }
 
   // ...........................................................................
@@ -272,17 +362,22 @@ export class BsPeer implements Bs {
     expiresIn: number,
     permissions?: 'read' | 'delete',
   ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      this._socket.emit(
-        'generateSignedUrl',
-        blobId,
-        expiresIn,
-        permissions,
-        (error: Error | null, url?: string) => {
-          if (error) reject(error);
-          else resolve(url!);
-        },
-      );
-    });
+    if (!this.isOpen) return this._closedError();
+
+    return this._withTimeout(
+      new Promise((resolve, reject) => {
+        this._socket.emit(
+          'generateSignedUrl',
+          blobId,
+          expiresIn,
+          permissions,
+          (error: Error | null, url?: string) => {
+            if (error) reject(error);
+            else resolve(url!);
+          },
+        );
+      }),
+      'generateSignedUrl',
+    );
   }
 }

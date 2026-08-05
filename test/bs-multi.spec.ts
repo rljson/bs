@@ -4,7 +4,7 @@
 // Use of this source code is governed by terms that can be
 // found in the LICENSE file in the root of this package.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { BsMem, BsMulti, BsMultiBs, BsPeer, PeerSocketMock } from '../src';
 
@@ -717,6 +717,234 @@ describe('BsMulti', () => {
       await expect(multi.getBlobStream('any-blob-id')).rejects.toThrow(
         'Stream error',
       );
+    });
+  });
+
+  describe('closed-member skipping', () => {
+    /**
+     * Creates a BsPeer backed by its own BsMem + PeerSocketMock, already
+     * closed (isOpen === false). Used to simulate a known-dead readable
+     * that BsMulti must skip rather than query.
+     */
+    const closedPeer = async (): Promise<BsPeer> => {
+      const store = new BsMem();
+      const peerSocket = new PeerSocketMock(store);
+      const peer = new BsPeer(peerSocket);
+      await peer.init();
+      await peer.close();
+      expect(peer.isOpen).toBe(false);
+      return peer;
+    };
+
+    it('should skip a closed readable in getBlob and serve from the next open member', async () => {
+      const closed = await closedPeer();
+      const getBlobSpy = vi.spyOn(closed, 'getBlob');
+
+      const openStore = new BsMem();
+      const { blobId } = await openStore.setBlob('Served from open store');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: openStore, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const result = await multi.getBlob(blobId);
+      expect(result.content.toString()).toBe('Served from open store');
+      expect(getBlobSpy).not.toHaveBeenCalled();
+    });
+
+    it('should throw a distinct error from getBlob when all readables are closed', async () => {
+      const closed1 = await closedPeer();
+      const closed2 = await closedPeer();
+
+      const multi = new BsMulti([
+        { bs: closed1, priority: 0, read: true, write: false },
+        { bs: closed2, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      await expect(multi.getBlob('any-id')).rejects.toThrow(
+        'All readable Bs instances are closed',
+      );
+    });
+
+    it('should preserve sequential priority order when skipping closed members', async () => {
+      const closed = await closedPeer();
+      const closedGetBlobSpy = vi.spyOn(closed, 'getBlob');
+
+      const missingStore = new BsMem(); // Open, but does not have the blob
+      const missingGetBlobSpy = vi.spyOn(missingStore, 'getBlob');
+      const hittingStore = new BsMem();
+      const { blobId } = await hittingStore.setBlob('Third in line');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: missingStore, priority: 1, read: true, write: false },
+        { bs: hittingStore, priority: 2, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const result = await multi.getBlob(blobId);
+      expect(result.content.toString()).toBe('Third in line');
+      // Priority 0 was closed and must never be queried...
+      expect(closedGetBlobSpy).not.toHaveBeenCalled();
+      // ...while priority 1 (open, but missing the blob) WAS queried and
+      // missed before priority 2 succeeded — proving sequential order was
+      // preserved despite the closed member being skipped.
+      expect(missingGetBlobSpy).toHaveBeenCalledWith(blobId, undefined);
+    });
+
+    it('should skip a closed readable in getBlobStream and serve from the next open member', async () => {
+      const closed = await closedPeer();
+      const openStore = new BsMem();
+      const { blobId } = await openStore.setBlob('Stream from open store');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: openStore, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const stream = await multi.getBlobStream(blobId);
+      expect(stream).toBeInstanceOf(ReadableStream);
+    });
+
+    it('should throw a distinct error from getBlobStream when all readables are closed', async () => {
+      const closed = await closedPeer();
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+
+      await expect(multi.getBlobStream('any-id')).rejects.toThrow(
+        'All readable Bs instances are closed',
+      );
+    });
+
+    it('should skip a closed readable in blobExists and check the next open member', async () => {
+      const closed = await closedPeer();
+      const openStore = new BsMem();
+      const { blobId } = await openStore.setBlob('Exists in open store');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: openStore, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      expect(await multi.blobExists(blobId)).toBe(true);
+    });
+
+    it('should throw a distinct error from blobExists when all readables are closed', async () => {
+      const closed = await closedPeer();
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+
+      await expect(multi.blobExists('any-id')).rejects.toThrow(
+        'All readable Bs instances are closed',
+      );
+    });
+
+    it('should skip a closed readable in getBlobProperties and serve from the next open member', async () => {
+      const closed = await closedPeer();
+      const openStore = new BsMem();
+      const { blobId } = await openStore.setBlob('Properties from open store');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: openStore, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const props = await multi.getBlobProperties(blobId);
+      expect(props.blobId).toBe(blobId);
+    });
+
+    it('should throw a distinct error from getBlobProperties when all readables are closed', async () => {
+      const closed = await closedPeer();
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+
+      await expect(multi.getBlobProperties('any-id')).rejects.toThrow(
+        'All readable Bs instances are closed',
+      );
+    });
+
+    it('should skip a closed readable in listBlobs and collect from the next open member', async () => {
+      const closed = await closedPeer();
+      const openStore = new BsMem();
+      await openStore.setBlob('Listed from open store');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: openStore, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const result = await multi.listBlobs();
+      expect(result.blobs).toHaveLength(1);
+    });
+
+    it('should throw a distinct error from listBlobs when all readables are closed', async () => {
+      const closed = await closedPeer();
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+
+      await expect(multi.listBlobs()).rejects.toThrow(
+        'All readable Bs instances are closed',
+      );
+    });
+
+    it('should skip a closed readable in generateSignedUrl and serve from the next open member', async () => {
+      const closed = await closedPeer();
+      const openStore = new BsMem();
+      const { blobId } = await openStore.setBlob('URL from open store');
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+        { bs: openStore, priority: 1, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const url = await multi.generateSignedUrl(blobId, 3600);
+      expect(url).toContain(blobId);
+    });
+
+    it('should throw a distinct error from generateSignedUrl when all readables are closed', async () => {
+      const closed = await closedPeer();
+
+      const multi = new BsMulti([
+        { bs: closed, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+
+      await expect(
+        multi.generateSignedUrl('any-id', 3600),
+      ).rejects.toThrow('All readable Bs instances are closed');
+    });
+
+    it('should treat members without an isOpen flag as always open (e.g. BsMem)', async () => {
+      const plainStore = new BsMem();
+      const { blobId } = await plainStore.setBlob('No isOpen flag here');
+
+      const multi = new BsMulti([
+        { bs: plainStore, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+
+      const result = await multi.getBlob(blobId);
+      expect(result.content.toString()).toBe('No isOpen flag here');
     });
   });
 
