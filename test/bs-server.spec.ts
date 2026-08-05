@@ -43,6 +43,33 @@ describe('BsServer', () => {
       await server.addSocket(socket2);
       server.removeSocket(socket2);
     });
+
+    it('unregisters the CRUD listeners on removeSocket', async () => {
+      const socket2 = new SocketMock();
+      await server.addSocket(socket2);
+      // The transport layer registered a listener per CRUD event.
+      expect(socket2.listenerCount('getBlob')).toBeGreaterThan(0);
+      expect(socket2.listenerCount('setBlob')).toBeGreaterThan(0);
+
+      server.removeSocket(socket2);
+
+      // After removal every CRUD listener is gone — the socket no longer
+      // reacts to blob events (no leak, no duplicate execution when several
+      // BsServers shared the socket).
+      expect(socket2.listenerCount('getBlob')).toBe(0);
+      expect(socket2.listenerCount('setBlob')).toBe(0);
+      expect(socket2.listenerCount('listBlobs')).toBe(0);
+    });
+
+    it('removeSocket is idempotent and tolerates unknown sockets', async () => {
+      const socket2 = new SocketMock();
+      await server.addSocket(socket2);
+      server.removeSocket(socket2);
+      // Second removal of the same socket is a no-op.
+      expect(() => server.removeSocket(socket2)).not.toThrow();
+      // Removing a socket that was never added is a no-op.
+      expect(() => server.removeSocket(new SocketMock())).not.toThrow();
+    });
   });
 
   describe('setBlob', () => {
