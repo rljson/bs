@@ -99,14 +99,36 @@ export class PeerSocketMock implements Socket {
     return this;
   }
 
+  // ...........................................................................
+  /**
+   * Test-facing helper that forces the `connected` flag WITHOUT firing
+   * 'connect'/'disconnect' listeners. Used to simulate a dead peer: the
+   * remote side stops acking (like a half-open TCP connection) while the
+   * client (e.g. BsPeer.isOpen) still believes the socket is open. This
+   * isolates request-timeout behavior from the fail-fast closed-socket
+   * path, which only reacts to 'disconnect' events.
+   * @param connected - The connected state to force
+   */
+  setConnected(connected: boolean): void {
+    this.connected = connected;
+    this.disconnected = !connected;
+  }
+
   // ............................................................................
   /**
    * Emits an event, invoking the corresponding method on the Bs instance.
+   * When `connected` is false, the emit is swallowed and the ack callback
+   * is never invoked, simulating a dead peer that no longer responds.
    * @param eventName - The event name
    * @param args - Event arguments
    * @returns True if the event was handled
    */
   emit(eventName: string | symbol, ...args: unknown[]): boolean {
+    if (!this.connected) {
+      // Dead peer: swallow the emit, never invoke the ack callback.
+      return true;
+    }
+
     const fn = (this._bs as any)[eventName] as (
       ...args: unknown[]
     ) => Promise<unknown>;
