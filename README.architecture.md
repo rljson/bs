@@ -238,6 +238,14 @@ Server-side component that exposes a Bs instance over sockets.
 - Translate results back to socket responses
 - Handle multiple concurrent clients
 
+**Socket lifecycle / `removeSocket`:** the CRUD listeners registered in
+`addSocket` are retained by reference (per socket) so that `removeSocket`
+actually `socket.off()`s them. This matters when a single socket is shared by
+more than one server (e.g. a hub multiplexing several routes): without it, the
+blob listeners kept firing after removal, leaking handlers and executing every
+blob request once per server. `removeSocket` is idempotent — removing a socket
+twice, or one that was never added, is a no-op.
+
 **Transport Layer Generation:**
 ```typescript
 private _generateTransportLayer(bs: Bs) {
