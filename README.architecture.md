@@ -563,6 +563,65 @@ callback(new Error('Blob not found'), null);
    └─> Return to caller
 ```
 
+### Request Timeouts & Fail-Fast (BsPeer)
+
+A socket `emit()` has no built-in upper bound: if the remote peer is dead or
+partitioned but the local `Socket` never fires a `disconnect` event (e.g. a
+half-open TCP connection), the ack callback simply never arrives and the
+returned promise hangs forever. `BsPeer` guards against this with two
+independent mechanisms:
+
+**1. Per-request timeout**
+
+Every request method (`setBlob`, `getBlob`, `getBlobStream`, `deleteBlob`,
+`blobExists`, `getBlobProperties`, `listBlobs`, `generateSignedUrl`) wraps its
+ack-waiting promise with a private `_withTimeout()` helper:
+
+```typescript
+private _withTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+  if (this._requestTimeoutMs <= 0) return promise;
+  let timer: ReturnType<typeof setTimeout>;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`Timeout after ${this._requestTimeoutMs}ms on '${operation}'`));
+    }, this._requestTimeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    clearTimeout(timer!);
+  });
+}
+```
+
+- **Default**: `30_000` ms.
+- **Configurable**: pass `{ requestTimeoutMs }` as the second constructor
+  argument — `new BsPeer(socket, { requestTimeoutMs: 5_000 })`. Omitting the
+  options object (or the field) keeps the default, so existing
+  `new BsPeer(socket)` call sites are unaffected.
+- **Disabled**: any value `<= 0` bypasses the race entirely (useful for tests
+  that intentionally exercise slow paths).
+- The timer is always cleared in `finally`, whether the request settles or
+  times out, so no dangling timers leak.
+- Mirrors the equivalent `_withTimeout` pattern in `@rljson/io`'s `IoPeer`,
+  with the message wording adapted (`Timeout after <ms>ms on '<method>'`).
+
+**2. Fail-fast on a known-closed socket**
+
+`BsPeer` already tracks connection state via `isOpen` (flipped by the
+`connect`/`disconnect` socket listeners registered in `init()`). Every
+request method now checks `isOpen` **before** emitting:
+
+```typescript
+if (!this.isOpen) {
+  return Promise.reject(new Error('BsPeer: socket closed'));
+}
+```
+
+This avoids paying the full timeout cost when the disconnect is already
+known — e.g. after `close()` was called, or once a `disconnect` event has
+fired. The 30s timeout only applies to peers that are *silently* dead
+(socket layer still reports connected, but nothing ever acks); a peer that
+is known to be closed fails immediately.
+
 ## PULL vs PUSH Architecture
 
 ### PULL Architecture (Recommended)
@@ -769,6 +828,38 @@ async getBlob(blobId: string): Promise<{ content: Buffer; properties: BlobProper
 4. Return merged list
 ```
 
+### Closed-Member Skipping
+
+`BsMulti` iterates its readables **sequentially**, stopping at the first
+success (`getBlob`, `getBlobStream`, `blobExists`, `getBlobProperties`,
+`listBlobs`, `generateSignedUrl`) — it never uses `Promise.allSettled`. That
+makes it safe to skip a member outright instead of calling it and waiting
+for a rejection (or, without `BsPeer`'s request timeout, hanging forever):
+
+```typescript
+private _isClosed(bs: Bs): boolean {
+  return (bs as { isOpen?: boolean }).isOpen === false;
+}
+```
+
+- A member is skipped when its `isOpen` flag is present and `=== false`
+  (currently only `BsPeer` exposes `isOpen`).
+- Members without an `isOpen` flag (`BsMem` and similar in-process
+  implementations) are always treated as open — `undefined !== false`.
+- Skipping preserves the existing first-success / error-aggregation style of
+  each method (e.g. the `Blob not found: <id>` error once every open member
+  has been tried and missed).
+- **Distinct topology-failure error**: if *every* readable is closed, none of
+  them are actually queried, so there is no "not found" signal to report.
+  Reporting `Blob not found` in that situation would be misleading — it
+  would look like a verified absence rather than an unreachable topology.
+  Instead, `BsMulti` throws a distinct `All readable Bs instances are
+  closed` error, letting callers tell "definitely absent" apart from
+  "couldn't check". `blobExists` follows the same rule: it only returns
+  `false` once every open member has been asked and missed; if all
+  readables are closed it throws rather than returning a potentially
+  misleading `false`.
+
 ## Socket Abstraction Layer
 
 ### Design Philosophy
@@ -824,6 +915,25 @@ class PeerSocketMock implements Socket {
 ```
 
 **Use:** Testing BsPeer without BsServer, fastest mock.
+
+**Dead-peer simulation:** when `connected === false`, `emit()` swallows the
+call and never invokes the ack callback — mirroring a socket whose remote
+side has vanished without a clean `disconnect`. This is the scenario
+`BsPeer`'s request timeout exists for. Because calling `disconnect()` also
+fires the `disconnect` listeners (which flip `BsPeer.isOpen` to `false` and
+trigger the *fail-fast* path instead of the timeout path), tests that want
+to exercise the timeout in isolation use `setConnected(false)`, a test-facing
+helper that flips the `connected` flag without emitting `connect`/
+`disconnect` events:
+
+```typescript
+const socket = new PeerSocketMock(bsMem);
+const peer = new BsPeer(socket, { requestTimeoutMs: 50 });
+await peer.init(); // isOpen === true, connected === true
+
+socket.setConnected(false); // peer looks open, but goes silent
+await expect(peer.getBlob('id')).rejects.toThrow("Timeout after 50ms on 'getBlob'");
+```
 
 #### DirectionalSocketMock (Bidirectional)
 
@@ -900,6 +1010,14 @@ throw new Error('Blob not found in all stores');
 **Error Types:**
 - `Blob not found`: blobId doesn't exist
 - `No readable/writable Bs available`: BsMulti configuration error
+- `All readable Bs instances are closed`: BsMulti topology failure — every
+  readable member's `isOpen` is `false`, so nothing was actually queried
+  (distinct from `Blob not found`, which means every member *was* queried
+  and missed)
+- `BsPeer: socket closed`: fail-fast rejection when a request is made while
+  `BsPeer.isOpen === false`
+- `Timeout after <ms>ms on '<method>'`: a `BsPeer` request's ack never
+  arrived within `requestTimeoutMs`
 - `Method not found`: BsPeerBridge received unknown method
 - Network errors: Socket connection failures
 
