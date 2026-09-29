@@ -299,8 +299,7 @@ Server CANNOT push writes to client
 ```
 
 **Read-Only Methods Exposed:**
-- `getBlob` - Read blob content
-- `getBlobStream` - Stream blob content
+- `getBlob` - Read blob content, whole or by byte range
 - `blobExists` - Check existence
 - `getBlobProperties` - Get metadata
 - `listBlobs` - List available blobs
@@ -310,12 +309,30 @@ Server CANNOT push writes to client
 - `deleteBlob` - Would allow server to delete from client
 - `generateSignedUrl` - Management operation
 
+**Why `getBlobStream` is NOT a wire method**
+
+It used to be, and it could never answer. An acknowledgement crosses the wire as
+data; a `ReadableStream` is a live object with a reader, a queue and a lock. On
+socket.io it arrived as `{}`.
+
+`BsPeer.getBlobStream` now builds the stream on its own side out of ranged
+`getBlob` calls, `BLOB_CHUNK_BYTES` (4 MB) at a time. `DownloadBlobOptions.range`
+was already on the interface and `BsFs` was already honouring it with a positioned
+read off disk.
+
+Pull-based deliberately: the consumer's pace is the flow control, so there is no
+window, no credit protocol and no per-stream state on the server. Each pull is an
+ordinary request, which also means each one passes a hub's serving gate on its
+own — that is what makes the gate bound chunk-sized work instead of blob-sized.
+A whole-blob read cost the server the entire file in a Buffer plus the parser's
+copy, and the consumer the same again; it also could not exceed the transport's
+50 MB message cap at all.
+
 **Implementation:**
 ```typescript
 private _registerBsMethods(): void {
   const bsMethods = [
     'getBlob',           // ✅ READ
-    'getBlobStream',     // ✅ READ
     'blobExists',        // ✅ READ
     'getBlobProperties', // ✅ READ
     'listBlobs',         // ✅ READ
@@ -581,8 +598,8 @@ independent mechanisms:
 
 **1. Per-request timeout**
 
-Every request method (`setBlob`, `getBlob`, `getBlobStream`, `deleteBlob`,
-`blobExists`, `getBlobProperties`, `listBlobs`, `generateSignedUrl`) wraps its
+Every request method (`setBlob`, `getBlob`, `deleteBlob`, `blobExists`,
+`getBlobProperties`, `listBlobs`, `generateSignedUrl`) wraps its
 ack-waiting promise with a private `_withTimeout()` helper:
 
 ```typescript
@@ -718,7 +735,6 @@ await serverPeer.setBlob('data');  // Client-initiated write to server
 ```typescript
 // Only exposes reads:
 - getBlob           // ✅ READ
-- getBlobStream     // ✅ READ
 - blobExists        // ✅ READ
 - getBlobProperties // ✅ READ
 - listBlobs         // ✅ READ
@@ -840,7 +856,9 @@ async getBlob(blobId: string): Promise<{ content: Buffer; properties: BlobProper
 
 `BsMulti` iterates its readables **sequentially**, stopping at the first
 success (`getBlob`, `getBlobStream`, `blobExists`, `getBlobProperties`,
-`listBlobs`, `generateSignedUrl`) — it never uses `Promise.allSettled`. That
+`listBlobs`, `generateSignedUrl`) — `getBlobStream` included, though it is no
+longer a wire method: `BsMulti` delegates to a member's own implementation, and
+on a `BsPeer` that one is built locally from ranged `getBlob` pulls — it never uses `Promise.allSettled`. That
 makes it safe to skip a member outright instead of calling it and waiting
 for a rejection (or, without `BsPeer`'s request timeout, hanging forever):
 
@@ -1031,7 +1049,11 @@ throw new Error('Blob not found in all stores');
 
 ### Stream Handling
 
-**Buffer to Stream Conversion:**
+Local stores hand out a stream over their own bytes. `BsPeer` is the exception —
+it has no bytes of its own, so it pulls them; see **Why `getBlobStream` is NOT a
+wire method** above.
+
+**Buffer to Stream Conversion (`BsMem`):**
 ```typescript
 async getBlobStream(blobId: string): Promise<ReadableStream> {
   const stored = this.blobs.get(blobId);
@@ -1381,7 +1403,7 @@ it('should only expose read operations', async () => {
   bridge.start();
 
   // Verify read operations are registered
-  const readOps = ['getBlob', 'blobExists', 'getBlobProperties', 'listBlobs', 'getBlobStream'];
+  const readOps = ['getBlob', 'blobExists', 'getBlobProperties', 'listBlobs'];
   for (const op of readOps) {
     const listeners = socket._listeners.get(op);
     expect(listeners.length).toBeGreaterThan(0);
