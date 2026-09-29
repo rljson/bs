@@ -11,6 +11,7 @@ export { BsPeerBridge } from './bs-peer-bridge.js';
 export { BsPeer } from './bs-peer.js';
 export { BsServer } from './bs-server.js';
 export type { BsTestSetup } from './bs-test-setup.js';
+export { BLOB_CHUNK_BYTES } from './bs.js';
 export type {
   BlobProperties,
   Bs,

@@ -220,6 +220,60 @@ describe('BsPeer', () => {
         'Blob not found',
       );
     });
+
+    it('pulls a blob larger than one chunk in chunk-sized ranges', async () => {
+      // The whole point of the rewrite: a blob crosses as bytes, a bounded
+      // number of them at a time. What must be true is that no single request
+      // ever asks for the whole thing — that request is the one that put a
+      // gigabyte of ArrayBuffers on the cloud hub's heap.
+      // The production chunk is 4 MB; a fixture that size would make the test
+      // about allocation speed rather than about chunking.
+      const chunk = 64;
+      const small = new BsPeer(socket, { chunkBytes: chunk });
+      await small.init();
+      const content = Buffer.alloc(chunk * 3 + 7, 'a');
+      const { blobId } = await small.setBlob(content);
+
+      const asked: Array<{ start: number; end?: number }> = [];
+      const realGetBlob = small.getBlob.bind(small);
+      small.getBlob = (id, options) => {
+        if (options?.range) asked.push(options.range);
+        return realGetBlob(id, options);
+      };
+
+      const stream = await small.getBlobStream(blobId);
+      const reader = stream.getReader();
+      const chunks: Uint8Array[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+      }
+
+      expect(Buffer.concat(chunks).equals(content)).toBe(true);
+      expect(asked).toHaveLength(4);
+      expect(asked[0]).toEqual({ start: 0, end: chunk });
+      expect(asked[3]).toEqual({ start: chunk * 3, end: content.length });
+      for (const range of asked) {
+        expect((range.end ?? content.length) - range.start).toBeLessThanOrEqual(
+          chunk,
+        );
+      }
+    });
+
+    it('fails instead of spinning when a range comes back empty', async () => {
+      // A server that answers a range with nothing would otherwise drive this
+      // pull forever, one empty chunk at a time, and present as a hang — the
+      // hardest kind of fault to attribute. It says what happened instead.
+      const { blobId } = await bsPeer.setBlob(Buffer.alloc(32, 'b'));
+      bsPeer.getBlob = async () => ({
+        content: Buffer.alloc(0),
+        properties: { blobId, size: 32, createdAt: new Date() },
+      });
+
+      const stream = await bsPeer.getBlobStream(blobId);
+      await expect(stream.getReader().read()).rejects.toThrow('no bytes');
+    });
   });
 
   describe('deleteBlob', () => {

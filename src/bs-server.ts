@@ -111,7 +111,13 @@ export class BsServer {
         this._bs.setBlob(content),
       getBlob: (blobId: string, options?: DownloadBlobOptions) =>
         this._bs.getBlob(blobId, options),
-      getBlobStream: (blobId: string) => this._bs.getBlobStream(blobId),
+      // **No `getBlobStream` here, on purpose.** It used to be, and it could
+      // never answer: an acknowledgement crosses the wire as data, and a
+      // `ReadableStream` is a live object with a reader, a queue and a lock.
+      // On socket.io it arrived as `{}`. `BsPeer` now builds the stream on its
+      // own side out of ranged `getBlob` calls, so the bytes cross as bytes and
+      // a chunk at a time — which is also what keeps a hub from holding a whole
+      // blob while it serves one.
       deleteBlob: (blobId: string) => this._bs.deleteBlob(blobId),
       blobExists: (blobId: string) => this._bs.blobExists(blobId),
       getBlobProperties: (blobId: string) =>

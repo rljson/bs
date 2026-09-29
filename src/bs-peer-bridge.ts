@@ -55,9 +55,10 @@ export class BsPeerBridge {
   private _registerBsMethods(): void {
     // Core Bs interface methods (read-only for PULL architecture)
     // Only register read operations to match IoPeerBridge pattern
+    // No 'getBlobStream': a stream cannot cross a socket in an ack, so nothing
+    // emits it any more. `BsPeer` pulls ranged `getBlob` calls instead.
     const bsMethods = [
       'getBlob',
-      'getBlobStream',
       'blobExists',
       'getBlobProperties',
       'listBlobs',

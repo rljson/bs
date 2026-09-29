@@ -45,10 +45,10 @@ describe('BsPeerBridge', () => {
       const onSpy = vi.spyOn(socket, 'on');
       bridge.start();
 
-      // Only read operations should be registered (PULL-only)
+      // Only read operations should be registered (PULL-only). No
+      // 'getBlobStream': a stream cannot cross a socket in an ack.
       const readMethods = [
         'getBlob',
-        'getBlobStream',
         'blobExists',
         'getBlobProperties',
         'listBlobs',
@@ -393,7 +393,6 @@ describe('BsPeerBridge', () => {
         'blobExists',
         'getBlobProperties',
         'listBlobs',
-        'getBlobStream',
       ];
 
       for (const operation of readOperations) {
@@ -476,22 +475,19 @@ describe('BsPeerBridge', () => {
       expect(error).toBeNull();
     });
 
-    it('should handle getBlobStream through socket', async () => {
-      const { blobId } = await bs.setBlob('Stream test');
-
-      let result: any;
-      let error: any;
-
-      socket.emit('getBlobStream', blobId, (err: any, res: any) => {
-        result = res;
-        error = err;
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 10));
-
-      expect(result).toBeDefined();
-      expect(result).toBeInstanceOf(ReadableStream);
-      expect(error).toBeNull();
+    it('does NOT forward getBlobStream, because an ack cannot carry a stream', async () => {
+      // This test used to assert the opposite, and it passed: `SocketMock`
+      // delivers the acknowledgement in-process, so the very object the bridge
+      // produced came straight back and `toBeInstanceOf(ReadableStream)` held.
+      // Over any real socket the ack is serialised and the stream arrives as
+      // `{}` — a reader-less, lock-less empty object. The mock was not
+      // exercising the transport, it was standing in for it, and that is why
+      // the fault survived a full green suite for as long as it did.
+      await bs.setBlob('Stream test');
+      expect(
+        (socket as any)._listeners.get('getBlobStream'),
+        'the bridge still forwards an event nothing can answer',
+      ).toBeUndefined();
     });
   });
 
