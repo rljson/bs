@@ -35,6 +35,24 @@ export interface DownloadBlobOptions {
 }
 
 /**
+ * How many bytes one pull of a remote blob stream asks for.
+ *
+ * **The number that decides how much a hub holds while it serves.** Before
+ * ranged pulls, one blob read was one socket message: the server read the whole
+ * file into a Buffer, the parser made a second copy of it, and both lived until
+ * the consumer had it. On the cloud EventHub that was 487 MB of ArrayBuffers
+ * that never fell while the heap climbed to 926 MB, and the process died of
+ * `Ineffective mark-compacts` — full collections reclaiming 1.5 MB of 1020 MB,
+ * because none of it was garbage. It was all work in flight.
+ *
+ * 4 MB, chosen from both ends: far under the 50 MB socket message cap that a
+ * whole-blob read silently exceeds (a file past that limit cannot cross a
+ * socket at all today, whatever the memory), and large enough that a 1 GB blob
+ * is 256 round trips rather than 256 000.
+ */
+export const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
+
+/**
  * Options for listing blobs
  */
 export interface ListBlobsOptions {

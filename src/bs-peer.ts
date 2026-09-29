@@ -5,6 +5,7 @@
 // found in the LICENSE file in the root of this package.
 
 import {
+  BLOB_CHUNK_BYTES,
   BlobProperties,
   Bs,
   DownloadBlobOptions,
@@ -22,6 +23,16 @@ export interface BsPeerOptions {
    * error. Defaults to 30_000. A non-positive value disables the timeout.
    */
   requestTimeoutMs?: number;
+
+  /**
+   * Bytes per pull in {@link BsPeer.getBlobStream}. Defaults to
+   * {@link BLOB_CHUNK_BYTES}.
+   *
+   * Worth lowering on a link where one 4 MB message is itself too much to hold,
+   * and worth lowering in a test so a fixture can cross several chunks without
+   * being megabytes wide.
+   */
+  chunkBytes?: number;
 }
 
 /**
@@ -32,12 +43,14 @@ export class BsPeer implements Bs {
   isOpen: boolean = false;
 
   private readonly _requestTimeoutMs: number;
+  private readonly _chunkBytes: number;
 
   constructor(
     private _socket: Socket,
     options?: BsPeerOptions,
   ) {
     this._requestTimeoutMs = options?.requestTimeoutMs ?? 30_000;
+    this._chunkBytes = options?.chunkBytes ?? BLOB_CHUNK_BYTES;
   }
 
   // ...........................................................................
@@ -235,26 +248,71 @@ export class BsPeer implements Bs {
 
   // ...........................................................................
   /**
-   * Retrieves a blob by its ID as a ReadableStream.
+   * Retrieves a blob by its ID as a ReadableStream, pulled in chunks.
+   *
+   * ## Why this is not one request
+   *
+   * It used to be: `emit('getBlobStream', blobId, cb)`, expecting a
+   * `ReadableStream` back in the acknowledgement. **That could never work.** An
+   * ack crosses the wire as data, and a stream is a live object with a reader,
+   * a queue and a lock — none of which survives serialisation. On socket.io it
+   * arrives as `{}`. The method was on the interface, had an implementation on
+   * every class, was covered by tests against a mock that handed the object
+   * straight back, and was broken for every real socket in the system. Nothing
+   * called it, which is the only reason it never showed.
+   *
+   * So the stream is built on this side instead, out of ranged
+   * {@link getBlob} calls — `DownloadBlobOptions.range` was already on the
+   * interface, and {@link BsFs} was already honouring it with a positioned read
+   * off disk. Nobody was asking.
+   *
+   * ## What it changes
+   *
+   * A whole-blob read costs the server the entire file in a Buffer plus the
+   * parser's copy of it, and costs the consumer the same again — for one file,
+   * at one moment, per reader. A pull costs both sides one
+   * {@link BLOB_CHUNK_BYTES} chunk.
+   *
+   * Pull-based, deliberately: the consumer's own pace is the flow control, so
+   * no window, no credit protocol and no stream bookkeeping on the server. Each
+   * pull is an ordinary request that passes the hub's serving gate on its own,
+   * which is what makes that gate bound chunk-sized work instead of
+   * blob-sized.
    * @param blobId - The unique identifier of the blob
    * @returns Promise resolving to readable stream
    */
-  getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
+  async getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
     if (!this.isOpen) return this._closedError();
 
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit(
-          'getBlobStream',
-          blobId,
-          (error: Error | null, result?: ReadableStream<Uint8Array>) => {
-            if (error) reject(error);
-            else resolve(result!);
-          },
-        );
-      }),
-      'getBlobStream',
-    );
+    // The blob's size decides how many pulls this takes, and asking for it
+    // first also fails fast on a missing blob — before the caller is handed a
+    // stream that can only fail on its first read.
+    const { size } = await this.getBlobProperties(blobId);
+
+    let offset = 0;
+    return new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        if (offset >= size) {
+          controller.close();
+          return;
+        }
+        const end = Math.min(offset + this._chunkBytes, size);
+        const { content } = await this.getBlob(blobId, {
+          range: { start: offset, end },
+        });
+        // A server that answers a range with nothing would otherwise spin this
+        // pull forever, one empty chunk at a time, and look like a hang rather
+        // than a fault.
+        if (content.length === 0) {
+          throw new Error(
+            `Blob '${blobId}' returned no bytes for range ` +
+              `${String(offset)}-${String(end)} of ${String(size)}`,
+          );
+        }
+        offset += content.length;
+        controller.enqueue(new Uint8Array(content));
+      },
+    });
   }
 
   // ...........................................................................
