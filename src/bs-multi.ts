@@ -45,11 +45,41 @@ export type BsMultiBs = {
  *
  * **The bound applies only while a FALLBACK exists.** The last readable is
  * never bounded, because there is nobody else to ask — so a cloud store, which
- * the hub deliberately places last, keeps exactly the behaviour it had. A
- * source that is abandoned is recorded like any other failure, so a read that
- * genuinely cannot be served still reports that rather than a false absence.
+ * the hub deliberately places last, keeps exactly the behaviour it had.
+ *
+ * **It decides who is asked FIRST, never who is believed.** A source past the
+ * bound is SET ASIDE, not abandoned: if no other source can answer, the
+ * cascade comes back to it and waits out the source's own request timeout
+ * (30 s in `BsPeer`). The first version of this did abandon it, and that cost
+ * a working read within a day — `@rljson/server` CI, one test in 545: client B
+ * asked for a blob only client A held, so the read went over a socket, through
+ * the hub and back, which on a loaded runner takes longer than two seconds.
+ * The cascade gave up with the data sitting there, reachable. *Slow is not
+ * silent, and a blob is not a row: the product's own ceiling is 50 MB.*
  */
 export const BLOB_SOURCE_TIMEOUT_MS = 2_000;
+
+// ...........................................................................
+/**
+ * A source that lost its turn, not a source that failed.
+ *
+ * Thrown by the bound so one `catch` can tell the two apart. It carries the
+ * source's still-pending answer, which is the whole point: the cascade sets
+ * the source aside, asks everybody else, and comes back to this promise if
+ * nobody else could help.
+ */
+class SetAside extends Error {
+  constructor(
+    readonly pending: Promise<unknown>,
+    readonly sourceId?: string,
+  ) {
+    super(
+      `BsMulti: source did not answer within ${BLOB_SOURCE_TIMEOUT_MS}ms — ` +
+        `asking the others first`,
+    );
+    this.name = 'SetAside';
+  }
+}
 
 /**
  * Multi-tier Bs implementation that combines multiple underlying Bs instances
@@ -98,40 +128,114 @@ export class BsMulti implements Bs {
    * Bounds one source's answer so the cascade can move on to the next.
    *
    * Only applied when a fallback exists — see {@link BLOB_SOURCE_TIMEOUT_MS}.
-   * The rejection is caught by the caller's `try`, which records it and
-   * continues, so an abandoned source behaves exactly like one that errored.
-   *
-   * A late answer is DISCARDED, and a late stream is cancelled: abandoning a
-   * `ReadableStream` without cancelling it leaves the source pushing bytes
-   * nobody will read.
+   * Past the bound this rejects with a {@link SetAside}, which the caller
+   * recognises: the source is NOT a failure and NOT finished, it has simply
+   * lost its turn. Its pending answer rides along on the marker so the caller
+   * can come back to it when nobody else could help.
    * @param work - The source's pending answer.
    * @param index - Position of the source, for the fallback check.
-   * @param what - Operation name, for the message.
-   * @returns The answer, or a rejection once the bound passes.
+   * @param id - The source's id. Only `getBlob` needs it, to skip the source
+   * it read from when hot-swapping; the other cascades pass nothing.
+   * @returns The answer, or a `SetAside` rejection once the bound passes.
    */
-  private _bounded<T>(work: Promise<T>, index: number, what: string): Promise<T> {
+  private _bounded<T>(
+    work: Promise<T>,
+    index: number,
+    id?: string,
+  ): Promise<T> {
     if (!this._hasFallback(index)) return work;
     let timer: ReturnType<typeof setTimeout>;
     return Promise.race([
       work,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          void work.then(
-            (late) => {
-              const stream = late as { cancel?: () => unknown } | undefined;
-              if (typeof stream?.cancel === 'function') void stream.cancel();
-            },
-            () => undefined,
-          );
-          reject(
-            new Error(
-              `BsMulti.${what}: source did not answer within ` +
-                `${BLOB_SOURCE_TIMEOUT_MS}ms — asking the next`,
-            ),
-          );
-        }, BLOB_SOURCE_TIMEOUT_MS);
+        timer = setTimeout(
+          () => reject(new SetAside(work, id)),
+          BLOB_SOURCE_TIMEOUT_MS,
+        );
       }),
     ]).finally(() => clearTimeout(timer));
+  }
+
+  /**
+   * Throws away an answer nobody is waiting for any more.
+   *
+   * A `ReadableStream` left unread keeps its source pushing bytes, so a set
+   * aside stream that is no longer needed has to be cancelled rather than
+   * merely dropped. A rejection is absorbed: it belongs to a question already
+   * answered elsewhere, and an unhandled one would crash the process.
+   * @param pending - The answer to discard.
+   */
+  private static _discard(pending: Promise<unknown>): void {
+    void pending.then(
+      (value) => {
+        const stream = value as { cancel?: () => unknown } | undefined;
+        if (typeof stream?.cancel === 'function') void stream.cancel();
+      },
+      () => undefined,
+    );
+  }
+
+  /**
+   * The message of something that was thrown, whatever it turned out to be.
+   *
+   * **A rejection is not always an `Error`.** socket.io serialises one across
+   * the wire as `{}`, and `BsPeer.isReady` rejects with no argument at all.
+   * Reading `.message` off those threw a `TypeError` — "Cannot read properties
+   * of undefined" — from inside the code whose whole job was to explain a
+   * failure, so the cascade reported a crash in itself instead of the blob it
+   * could not find.
+   * @param error - Whatever a source rejected with.
+   * @returns Its message, or an empty string when it has none.
+   */
+  private static _messageOf(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === 'string') return error;
+    const message = (error as { message?: unknown } | undefined)?.message;
+    return typeof message === 'string' ? message : '';
+  }
+
+  /**
+   * Whatever was thrown, as something a caller can catch and read.
+   * @param error - Whatever a source rejected with.
+   * @returns The error itself, or an `Error` describing it.
+   */
+  private static _asError(error: unknown): Error {
+    if (error instanceof Error) return error;
+    const message = BsMulti._messageOf(error);
+    if (message !== '') return new Error(message);
+    // `JSON.stringify(undefined)` is `undefined`, not `'undefined'`.
+    const described = JSON.stringify(error) ?? 'nothing';
+    return new Error(`BsMulti: a source failed with ${described}`);
+  }
+
+  /**
+   * Classifies an exhausted cascade and throws the right thing.
+   *
+   * **A real failure outranks an absence, wherever in the list it sits.** Only
+   * when EVERY source said "not found" is the blob actually absent; if one of
+   * them broke, reporting an absence would be a lie with consequences — a sync
+   * agent that believes a blob is gone can decide to delete what points at it.
+   *
+   * The code this replaces threw `errors[0]`, which was the first error rather
+   * than the first real one, and its own comment said otherwise. That was
+   * harmless while the cascade only ever recorded errors in source order; it
+   * stopped being harmless once a source could be set aside and re-asked at
+   * the END, which puts its failure last.
+   * @param errors - Everything the sources rejected with.
+   * @param blobId - The blob that could not be read.
+   */
+  private static _throwExhausted(errors: unknown[], blobId: string): never {
+    // `findIndex`, not `find`: `BsPeer.isReady` rejects with NO ARGUMENT, so a
+    // real failure can itself be `undefined` — and `find` cannot tell that
+    // apart from having found nothing. It would report an absence for a source
+    // that broke, which is the one lie this method exists to avoid.
+    const first = errors.findIndex(
+      (error) => !BsMulti._messageOf(error).includes('Blob not found'),
+    );
+    if (first === -1) {
+      throw new Error(`Blob not found: ${blobId}`);
+    }
+    throw BsMulti._asError(errors[first]);
   }
 
   private _isClosed(bs: Bs): boolean {
@@ -176,9 +280,11 @@ export class BsMulti implements Bs {
       throw new Error('No readable Bs available');
     }
 
-    let result: { content: Buffer; properties: BlobProperties } | undefined;
+    type Answer = { content: Buffer; properties: BlobProperties };
+    let result: Answer | undefined;
     let readFrom: string = '';
-    const errors: Error[] = [];
+    const errors: unknown[] = [];
+    const setAside: SetAside[] = [];
     let allClosed = true;
 
     // Try readables in priority order
@@ -192,14 +298,34 @@ export class BsMulti implements Bs {
         result = await this._bounded(
           readable.bs.getBlob(blobId, options),
           index,
-          'getBlob',
+          readable.id,
         );
         readFrom = readable.id ?? '';
         break; // Stop after first successful read
       } catch (e) {
-        errors.push(e as Error);
+        if (e instanceof SetAside) setAside.push(e);
+        else errors.push(e);
         continue;
       }
+    }
+
+    // Nobody else could answer, so come back to the sources that only lost
+    // their turn. Each still carries its own request timeout.
+    if (!result) {
+      for (let i = 0; i < setAside.length; i++) {
+        try {
+          result = (await setAside[i].pending) as Answer;
+          readFrom = setAside[i].sourceId ?? '';
+          for (const rest of setAside.slice(i + 1)) {
+            BsMulti._discard(rest.pending);
+          }
+          break;
+        } catch (e) {
+          errors.push(e);
+        }
+      }
+    } else {
+      for (const aside of setAside) BsMulti._discard(aside.pending);
     }
 
     if (!result) {
@@ -208,17 +334,7 @@ export class BsMulti implements Bs {
         // verified absence, so it must not look like "Blob not found".
         throw new Error('All readable Bs instances are closed');
       }
-
-      // Blob not found in any readable
-      /* v8 ignore next -- @preserve */
-      const notFoundErrors = errors.filter((err) =>
-        err.message.includes('Blob not found'),
-      );
-      if (notFoundErrors.length === errors.length) {
-        throw new Error(`Blob not found: ${blobId}`);
-      } else {
-        throw errors[0]; // Throw first non-"not found" error
-      }
+      BsMulti._throwExhausted(errors, blobId);
     }
 
     // Hot-swap: write blob to all writables (except source) for caching
@@ -246,7 +362,8 @@ export class BsMulti implements Bs {
       throw new Error('No readable Bs available');
     }
 
-    const errors: Error[] = [];
+    const errors: unknown[] = [];
+    const setAside: SetAside[] = [];
     let allClosed = true;
 
     // Try readables in priority order
@@ -257,31 +374,37 @@ export class BsMulti implements Bs {
       }
       allClosed = false;
       try {
-        return await this._bounded(
+        const stream = await this._bounded(
           readable.bs.getBlobStream(blobId),
           index,
-          'getBlobStream',
         );
+        for (const aside of setAside) BsMulti._discard(aside.pending);
+        return stream;
       } catch (e) {
-        errors.push(e as Error);
+        if (e instanceof SetAside) setAside.push(e);
+        else errors.push(e);
         continue;
+      }
+    }
+
+    // Nobody else could answer — come back to the ones set aside.
+    for (let i = 0; i < setAside.length; i++) {
+      try {
+        const stream = (await setAside[i]
+          .pending) as ReadableStream<Uint8Array>;
+        for (const rest of setAside.slice(i + 1)) {
+          BsMulti._discard(rest.pending);
+        }
+        return stream;
+      } catch (e) {
+        errors.push(e);
       }
     }
 
     if (allClosed) {
       throw new Error('All readable Bs instances are closed');
     }
-
-    // Blob not found in any readable
-    /* v8 ignore next -- @preserve */
-    const notFoundErrors = errors.filter((err) =>
-      err.message.includes('Blob not found'),
-    );
-    if (notFoundErrors.length === errors.length) {
-      throw new Error(`Blob not found: ${blobId}`);
-    } else {
-      throw errors[0];
-    }
+    BsMulti._throwExhausted(errors, blobId);
   }
 
   // ...........................................................................
@@ -313,6 +436,7 @@ export class BsMulti implements Bs {
 
     // Check readables in priority order
     let allClosed = true;
+    const setAside: SetAside[] = [];
     for (let index = 0; index < this.readables.length; index++) {
       const readable = this.readables[index];
       if (this._isClosed(readable.bs)) {
@@ -323,9 +447,25 @@ export class BsMulti implements Bs {
         const exists = await this._bounded(
           readable.bs.blobExists(blobId),
           index,
-          'blobExists',
         );
         if (exists) {
+          for (const aside of setAside) BsMulti._discard(aside.pending);
+          return true;
+        }
+      } catch (e) {
+        if (e instanceof SetAside) setAside.push(e);
+        continue;
+      }
+    }
+
+    // `false` here would be a verified absence, and a source that only lost
+    // its turn has verified nothing. Ask it before answering.
+    for (let i = 0; i < setAside.length; i++) {
+      try {
+        if ((await setAside[i].pending) === true) {
+          for (const rest of setAside.slice(i + 1)) {
+            BsMulti._discard(rest.pending);
+          }
           return true;
         }
       } catch {
@@ -353,7 +493,8 @@ export class BsMulti implements Bs {
       throw new Error('No readable Bs available');
     }
 
-    const errors: Error[] = [];
+    const errors: unknown[] = [];
+    const setAside: SetAside[] = [];
     let allClosed = true;
 
     // Try readables in priority order
@@ -364,31 +505,36 @@ export class BsMulti implements Bs {
       }
       allClosed = false;
       try {
-        return await this._bounded(
+        const properties = await this._bounded(
           readable.bs.getBlobProperties(blobId),
           index,
-          'getBlobProperties',
         );
+        for (const aside of setAside) BsMulti._discard(aside.pending);
+        return properties;
       } catch (e) {
-        errors.push(e as Error);
+        if (e instanceof SetAside) setAside.push(e);
+        else errors.push(e);
         continue;
+      }
+    }
+
+    // Nobody else could answer — come back to the ones set aside.
+    for (let i = 0; i < setAside.length; i++) {
+      try {
+        const properties = (await setAside[i].pending) as BlobProperties;
+        for (const rest of setAside.slice(i + 1)) {
+          BsMulti._discard(rest.pending);
+        }
+        return properties;
+      } catch (e) {
+        errors.push(e);
       }
     }
 
     if (allClosed) {
       throw new Error('All readable Bs instances are closed');
     }
-
-    // Blob not found in any readable
-    /* v8 ignore next -- @preserve */
-    const notFoundErrors = errors.filter((err) =>
-      err.message.includes('Blob not found'),
-    );
-    if (notFoundErrors.length === errors.length) {
-      throw new Error(`Blob not found: ${blobId}`);
-    } else {
-      throw errors[0];
-    }
+    BsMulti._throwExhausted(errors, blobId);
   }
 
   // ...........................................................................
