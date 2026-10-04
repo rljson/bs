@@ -29,6 +29,29 @@ export type BsMultiBs = {
 
 // ...........................................................................
 /**
+ * How long ONE source may take to answer a read while another source could
+ * still be asked.
+ *
+ * Every read here walks the readables in priority order and only skips a
+ * source it can SEE is gone (`_isClosed`). A source that is still open and
+ * simply never answers therefore blocked the whole cascade for its full
+ * request timeout — and a blob read is on the restore path, so the cost landed
+ * on a user's files rather than on a diagnostic.
+ *
+ * Traced in `@rljson/fs-agent`: a node fetched a peer's tree in 4 s, started
+ * the restore, and the restore timed out at 15 s because the blob fetch was
+ * waiting on a cut peer. The re-created file arrived only when the window was
+ * widened to 120 s. `@rljson/io` carries the same fix for its row reads.
+ *
+ * **The bound applies only while a FALLBACK exists.** The last readable is
+ * never bounded, because there is nobody else to ask — so a cloud store, which
+ * the hub deliberately places last, keeps exactly the behaviour it had. A
+ * source that is abandoned is recorded like any other failure, so a read that
+ * genuinely cannot be served still reports that rather than a false absence.
+ */
+export const BLOB_SOURCE_TIMEOUT_MS = 2_000;
+
+/**
  * Multi-tier Bs implementation that combines multiple underlying Bs instances
  * with different capabilities (read, write) and priorities.
  *
@@ -60,6 +83,57 @@ export class BsMulti implements Bs {
    * @param bs - The Bs instance to check
    * @returns True if the instance exposes `isOpen === false`
    */
+  /**
+   * Whether any source after `index` could still answer.
+   * @param index - Position of the source being asked.
+   * @returns True when a later, non-closed readable exists.
+   */
+  private _hasFallback(index: number): boolean {
+    return this.readables
+      .slice(index + 1)
+      .some((later) => !this._isClosed(later.bs));
+  }
+
+  /**
+   * Bounds one source's answer so the cascade can move on to the next.
+   *
+   * Only applied when a fallback exists — see {@link BLOB_SOURCE_TIMEOUT_MS}.
+   * The rejection is caught by the caller's `try`, which records it and
+   * continues, so an abandoned source behaves exactly like one that errored.
+   *
+   * A late answer is DISCARDED, and a late stream is cancelled: abandoning a
+   * `ReadableStream` without cancelling it leaves the source pushing bytes
+   * nobody will read.
+   * @param work - The source's pending answer.
+   * @param index - Position of the source, for the fallback check.
+   * @param what - Operation name, for the message.
+   * @returns The answer, or a rejection once the bound passes.
+   */
+  private _bounded<T>(work: Promise<T>, index: number, what: string): Promise<T> {
+    if (!this._hasFallback(index)) return work;
+    let timer: ReturnType<typeof setTimeout>;
+    return Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          void work.then(
+            (late) => {
+              const stream = late as { cancel?: () => unknown } | undefined;
+              if (typeof stream?.cancel === 'function') void stream.cancel();
+            },
+            () => undefined,
+          );
+          reject(
+            new Error(
+              `BsMulti.${what}: source did not answer within ` +
+                `${BLOB_SOURCE_TIMEOUT_MS}ms — asking the next`,
+            ),
+          );
+        }, BLOB_SOURCE_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(timer));
+  }
+
   private _isClosed(bs: Bs): boolean {
     return (bs as { isOpen?: boolean }).isOpen === false;
   }
@@ -108,13 +182,18 @@ export class BsMulti implements Bs {
     let allClosed = true;
 
     // Try readables in priority order
-    for (const readable of this.readables) {
+    for (let index = 0; index < this.readables.length; index++) {
+      const readable = this.readables[index];
       if (this._isClosed(readable.bs)) {
         continue; // Skip known-closed peers instead of hanging on them
       }
       allClosed = false;
       try {
-        result = await readable.bs.getBlob(blobId, options);
+        result = await this._bounded(
+          readable.bs.getBlob(blobId, options),
+          index,
+          'getBlob',
+        );
         readFrom = readable.id ?? '';
         break; // Stop after first successful read
       } catch (e) {
@@ -171,13 +250,18 @@ export class BsMulti implements Bs {
     let allClosed = true;
 
     // Try readables in priority order
-    for (const readable of this.readables) {
+    for (let index = 0; index < this.readables.length; index++) {
+      const readable = this.readables[index];
       if (this._isClosed(readable.bs)) {
         continue; // Skip known-closed peers instead of hanging on them
       }
       allClosed = false;
       try {
-        return await readable.bs.getBlobStream(blobId);
+        return await this._bounded(
+          readable.bs.getBlobStream(blobId),
+          index,
+          'getBlobStream',
+        );
       } catch (e) {
         errors.push(e as Error);
         continue;
@@ -229,13 +313,18 @@ export class BsMulti implements Bs {
 
     // Check readables in priority order
     let allClosed = true;
-    for (const readable of this.readables) {
+    for (let index = 0; index < this.readables.length; index++) {
+      const readable = this.readables[index];
       if (this._isClosed(readable.bs)) {
         continue; // Skip known-closed peers instead of hanging on them
       }
       allClosed = false;
       try {
-        const exists = await readable.bs.blobExists(blobId);
+        const exists = await this._bounded(
+          readable.bs.blobExists(blobId),
+          index,
+          'blobExists',
+        );
         if (exists) {
           return true;
         }
@@ -268,13 +357,18 @@ export class BsMulti implements Bs {
     let allClosed = true;
 
     // Try readables in priority order
-    for (const readable of this.readables) {
+    for (let index = 0; index < this.readables.length; index++) {
+      const readable = this.readables[index];
       if (this._isClosed(readable.bs)) {
         continue; // Skip known-closed peers instead of hanging on them
       }
       allClosed = false;
       try {
-        return await readable.bs.getBlobProperties(blobId);
+        return await this._bounded(
+          readable.bs.getBlobProperties(blobId),
+          index,
+          'getBlobProperties',
+        );
       } catch (e) {
         errors.push(e as Error);
         continue;
