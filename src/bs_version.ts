@@ -2,4 +2,4 @@
 // Kept in sync by test/bs_version.spec.ts.
 
 /** The version of the `@rljson/bs` package. */
-export const bsVersion = '0.0.30';
+export const bsVersion = '0.0.31';
