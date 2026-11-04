@@ -38,6 +38,11 @@
   `SLOW_SOURCE_MEMORY_MS`.
 - **Both ends of a socket need this version.** An older peer neither asks for
   nor answers blocks.
+- **A stream asks for up to four blocks ahead** (`BLOCK_READ_AHEAD`), in
+  order, holding at most four blocks. One at a time cost a round trip per
+  block: with 10 ms per round trip, 60 MB took 625 ms one at a time and
+  164 ms four ahead. A block that fails fails the stream where the reader
+  reaches it; a cancelled stream asks for nothing more.
 
 ### CLAUDE.md keeps this repo's own rules
 

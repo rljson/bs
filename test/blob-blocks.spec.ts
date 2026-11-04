@@ -13,6 +13,7 @@ import {
   BLOCK_AVG_BYTES,
   BLOCK_MAX_BYTES,
   BLOCK_MIN_BYTES,
+  BLOCK_READ_AHEAD,
   blockEnd,
   forEachBlock,
   ContentId,
@@ -247,6 +248,115 @@ describe('blob-blocks', () => {
       });
       expect((await readAll(stream)).equals(small)).toBe(true);
       expect(completed).toBe(true);
+    });
+
+    describe('ahead of the reader', () => {
+      const parts = Array.from({ length: 10 }, (_, i) =>
+        Buffer.from(`part ${i};`),
+      );
+      const many: BlobBlock[] = parts.map((p) => ({
+        blockId: ContentId.of(p),
+        size: p.length,
+      }));
+      const manyId = ContentId.of(Buffer.concat(parts));
+
+      /** A block source whose answers the test releases, in any order. */
+      const slowSource = () => {
+        const waiting = new Map<string, () => void>();
+        const asked: string[] = [];
+        let inFlight = 0;
+        let most = 0;
+        const read = (blockId: string) => {
+          asked.push(blockId);
+          most = Math.max(most, ++inFlight);
+          return new Promise<Buffer>((resolve, reject) => {
+            waiting.set(blockId, () => {
+              inFlight--;
+              const i = many.findIndex((b) => b.blockId === blockId);
+              if (i === 5 && failFifth) reject(new Error('peer went away'));
+              else resolve(parts[i]!);
+            });
+          });
+        };
+        let failFifth = false;
+        return {
+          read,
+          asked,
+          most: () => most,
+          failFifth: () => {
+            failFifth = true;
+          },
+          /** Answers every open request, the newest first. */
+          answerAll: () => {
+            for (const id of [...waiting.keys()].reverse()) {
+              const answer = waiting.get(id)!;
+              waiting.delete(id);
+              answer();
+            }
+          },
+        };
+      };
+
+      it('asks for up to four blocks at once, and hands them out in order', async () => {
+        const source = slowSource();
+        const reader = streamBlocks(manyId, many, source.read).getReader();
+        const out: Buffer[] = [];
+        for (;;) {
+          const next = reader.read();
+          await new Promise((r) => setImmediate(r));
+          source.answerAll();
+          const { done, value } = await next;
+          if (done) break;
+          out.push(Buffer.from(value));
+        }
+        expect(Buffer.concat(out).equals(Buffer.concat(parts))).toBe(true);
+        expect(source.most()).toBe(BLOCK_READ_AHEAD);
+        expect(source.asked).toEqual(many.map((b) => b.blockId));
+      });
+
+      it('fails at the block that failed, after the blocks before it', async () => {
+        const source = slowSource();
+        source.failFifth();
+        const reader = streamBlocks(manyId, many, source.read).getReader();
+        const out: string[] = [];
+        let failure: unknown;
+        try {
+          for (;;) {
+            const next = reader.read();
+            // Failed before it is awaited, once the fifth block is in.
+            next.catch(() => undefined);
+            await new Promise((r) => setImmediate(r));
+            source.answerAll();
+            const { done, value } = await next;
+            if (done) break;
+            out.push(Buffer.from(value).toString());
+          }
+        } catch (e) {
+          failure = e;
+        }
+        expect(out).toEqual(parts.slice(0, 5).map(String));
+        expect(String(failure)).toContain('peer went away');
+      });
+
+      it('asks one at a time when told to, and for nothing more once cancelled', async () => {
+        const source = slowSource();
+        const reader = streamBlocks(
+          manyId,
+          many,
+          source.read,
+          undefined,
+          1,
+        ).getReader();
+        const first = reader.read();
+        await new Promise((r) => setImmediate(r));
+        expect(source.asked).toHaveLength(1);
+        source.answerAll();
+        await first;
+        await reader.cancel();
+        source.answerAll();
+        expect(source.most()).toBe(1);
+        expect(source.asked.length).toBeLessThanOrEqual(2);
+      });
     });
 
     it('fails a stream whose blocks do not make the blob', async () => {

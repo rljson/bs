@@ -20,6 +20,7 @@ export {
   BLOCK_AVG_BYTES,
   BLOCK_MAX_BYTES,
   BLOCK_MIN_BYTES,
+  BLOCK_READ_AHEAD,
   ContentId,
   blockEnd,
   forEachBlock,

@@ -361,13 +361,29 @@ export const readBlocks = async (
 
 // .............................................................................
 /**
- * Streams a blob from its blocks, one block at a time, and fails the stream
- * at its end unless the bytes hash to `blobId`.
+ * How many blocks a stream asks for ahead of the one its reader is at.
+ *
+ * One block at a time costs a round trip per block: through a hub, a 400 MB
+ * file of ~1 MB blocks took 40 s on a LAN, about 10 MB/s, the time spent
+ * waiting rather than moving bytes. Four in flight hide that wait and hold
+ * at most four blocks — 16 MB — whatever the file's size.
+ */
+export const BLOCK_READ_AHEAD = 4;
+
+// .............................................................................
+/**
+ * Streams a blob from its blocks, in order, and fails the stream at its end
+ * unless the bytes hash to `blobId`.
+ *
+ * Asks for up to `readAhead` blocks before the reader needs them. A block
+ * that fails fails the stream when the reader reaches it, not before; a
+ * cancelled stream asks for nothing more.
  * @param blobId - The blob.
  * @param blocks - Its blocks, in order.
  * @param readBlock - Reads one block.
  * @param onComplete - Called once every byte was read and verified, before
  * the stream closes.
+ * @param readAhead - How many blocks may be asked for at once.
  * @returns The stream.
  */
 export const streamBlocks = (
@@ -375,12 +391,24 @@ export const streamBlocks = (
   blocks: BlobBlock[],
   readBlock: ReadBlock,
   onComplete?: () => Promise<void>,
+  readAhead: number = BLOCK_READ_AHEAD,
 ): ReadableStream<Uint8Array> => {
   const whole = new ContentId();
-  let index = 0;
+  const inFlight: Promise<Buffer>[] = [];
+  let requested = 0;
+  const askAhead = () => {
+    while (requested < blocks.length && inFlight.length < readAhead) {
+      const read = readBlock(blocks[requested++].blockId);
+      // Its failure belongs to the reader once it gets there.
+      read.catch(() => undefined);
+      inFlight.push(read);
+    }
+  };
   return new ReadableStream<Uint8Array>({
     pull: async (controller) => {
-      if (index === blocks.length) {
+      askAhead();
+      const next = inFlight.shift();
+      if (next === undefined) {
         const actual = whole.digest();
         if (actual !== blobId) {
           throw new Error(`Blocks of blob '${blobId}' make '${actual}'`);
@@ -389,11 +417,16 @@ export const streamBlocks = (
         controller.close();
         return;
       }
-      const bytes = await readBlock(blocks[index++].blockId);
+      const bytes = await next;
+      askAhead();
       whole.update(bytes);
       controller.enqueue(
         new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.length),
       );
+    },
+    cancel: () => {
+      requested = blocks.length;
+      inFlight.length = 0;
     },
   });
 };
