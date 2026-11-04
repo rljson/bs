@@ -4,11 +4,13 @@
 // Use of this source code is governed by terms that can be
 // found in the LICENSE file in the root of this package.
 
+import { readBlocks, streamBlocks } from './blob-blocks.ts';
 import { BsMem } from './bs-mem.js';
 import { BsPeer } from './bs-peer.js';
 import { PeerSocketMock } from './peer-socket-mock.js';
 
 import type {
+  BlobBlock,
   BlobProperties,
   Bs,
   DownloadBlobOptions,
@@ -55,9 +57,22 @@ export type BsMultiBs = {
  * asked for a blob only client A held, so the read went over a socket, through
  * the hub and back, which on a loaded runner takes longer than two seconds.
  * The cascade gave up with the data sitting there, reachable. *Slow is not
- * silent, and a blob is not a row: the product's own ceiling is 50 MB.*
+ * silent.*
  */
 export const BLOB_SOURCE_TIMEOUT_MS = 2_000;
+
+// ...........................................................................
+/**
+ * How long a source that lost its turn is asked after all others.
+ *
+ * A blob is read block by block, and every block is a question of its own. A
+ * source that never answers would otherwise cost every one of them the bound
+ * of {@link BLOB_SOURCE_TIMEOUT_MS} — two minutes for a 60-block file. Moved
+ * to the end, it is still asked whenever nobody else can answer, so a slow
+ * source is never given up on; it only stops being asked first. Afterwards it
+ * gets its turn again, in case it recovered.
+ */
+export const SLOW_SOURCE_MEMORY_MS = 30_000;
 
 // ...........................................................................
 /**
@@ -87,10 +102,16 @@ class SetAside extends Error {
  *
  * Pattern: Local cache + remote server fallback
  * - Lower priority number = checked first
- * - Reads from highest priority readable, with hot-swapping to cache
+ * - Reads block by block: each block from the highest priority readable that
+ *   holds it, so blocks a writable already holds are never fetched again
+ * - Every block read from elsewhere is kept in the writables, and a blob read
+ *   whole is stored there once all its blocks are
  * - Writes to all writable instances in parallel
  */
 export class BsMulti implements Bs {
+  /** Source → until when it is asked after all others. */
+  private readonly _slowUntil = new Map<Bs, number>();
+
   constructor(private _stores: Array<BsMultiBs>) {}
 
   // ...........................................................................
@@ -114,14 +135,29 @@ export class BsMulti implements Bs {
    * @returns True if the instance exposes `isOpen === false`
    */
   /**
+   * The readables in the order they are asked: by priority, except that the
+   * sources that recently lost their turn come last.
+   * @returns The readables.
+   */
+  private _askOrder(): Array<BsMultiBs> {
+    const now = Date.now();
+    const slow = (store: BsMultiBs) =>
+      (this._slowUntil.get(store.bs) ?? 0) > now;
+    const readables = this.readables;
+    return [
+      ...readables.filter((store) => !slow(store)),
+      ...readables.filter(slow),
+    ];
+  }
+
+  /**
    * Whether any source after `index` could still answer.
+   * @param order - The sources, in the order they are asked.
    * @param index - Position of the source being asked.
    * @returns True when a later, non-closed readable exists.
    */
-  private _hasFallback(index: number): boolean {
-    return this.readables
-      .slice(index + 1)
-      .some((later) => !this._isClosed(later.bs));
+  private _hasFallback(order: Array<BsMultiBs>, index: number): boolean {
+    return order.slice(index + 1).some((later) => !this._isClosed(later.bs));
   }
 
   /**
@@ -132,47 +168,40 @@ export class BsMulti implements Bs {
    * recognises: the source is NOT a failure and NOT finished, it has simply
    * lost its turn. Its pending answer rides along on the marker so the caller
    * can come back to it when nobody else could help.
+   * The source is also asked after all others for
+   * {@link SLOW_SOURCE_MEMORY_MS}.
    * @param work - The source's pending answer.
-   * @param index - Position of the source, for the fallback check.
-   * @param id - The source's id. Only `getBlob` needs it, to skip the source
-   * it read from when hot-swapping; the other cascades pass nothing.
+   * @param order - The sources, in the order they are asked.
+   * @param index - Position of the source in `order`.
    * @returns The answer, or a `SetAside` rejection once the bound passes.
    */
   private _bounded<T>(
     work: Promise<T>,
+    order: Array<BsMultiBs>,
     index: number,
-    id?: string,
   ): Promise<T> {
-    if (!this._hasFallback(index)) return work;
+    if (!this._hasFallback(order, index)) return work;
+    const { bs, id } = order[index];
     let timer: ReturnType<typeof setTimeout>;
     return Promise.race([
       work,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new SetAside(work, id)),
-          BLOB_SOURCE_TIMEOUT_MS,
-        );
+        timer = setTimeout(() => {
+          this._slowUntil.set(bs, Date.now() + SLOW_SOURCE_MEMORY_MS);
+          reject(new SetAside(work, id));
+        }, BLOB_SOURCE_TIMEOUT_MS);
       }),
     ]).finally(() => clearTimeout(timer));
   }
 
   /**
-   * Throws away an answer nobody is waiting for any more.
-   *
-   * A `ReadableStream` left unread keeps its source pushing bytes, so a set
-   * aside stream that is no longer needed has to be cancelled rather than
-   * merely dropped. A rejection is absorbed: it belongs to a question already
-   * answered elsewhere, and an unhandled one would crash the process.
+   * Throws away an answer nobody is waiting for any more. A rejection is
+   * absorbed: it belongs to a question already answered elsewhere, and an
+   * unhandled one would crash the process.
    * @param pending - The answer to discard.
    */
   private static _discard(pending: Promise<unknown>): void {
-    void pending.then(
-      (value) => {
-        const stream = value as { cancel?: () => unknown } | undefined;
-        if (typeof stream?.cancel === 'function') void stream.cancel();
-      },
-      () => undefined,
-    );
+    void pending.catch(() => undefined);
   }
 
   /**
@@ -222,18 +251,23 @@ export class BsMulti implements Bs {
    * stopped being harmless once a source could be set aside and re-asked at
    * the END, which puts its failure last.
    * @param errors - Everything the sources rejected with.
-   * @param blobId - The blob that could not be read.
+   * @param what - `Blob` or `Block`.
+   * @param id - The blob or block that could not be read.
    */
-  private static _throwExhausted(errors: unknown[], blobId: string): never {
+  private static _throwExhausted(
+    errors: unknown[],
+    what: 'Blob' | 'Block',
+    id: string,
+  ): never {
     // `findIndex`, not `find`: `BsPeer.isReady` rejects with NO ARGUMENT, so a
     // real failure can itself be `undefined` — and `find` cannot tell that
     // apart from having found nothing. It would report an absence for a source
     // that broke, which is the one lie this method exists to avoid.
     const first = errors.findIndex(
-      (error) => !BsMulti._messageOf(error).includes('Blob not found'),
+      (error) => !BsMulti._messageOf(error).includes(`${what} not found`),
     );
     if (first === -1) {
-      throw new Error(`Blob not found: ${blobId}`);
+      throw new Error(`${what} not found: ${id}`);
     }
     throw BsMulti._asError(errors[first]);
   }
@@ -266,42 +300,41 @@ export class BsMulti implements Bs {
 
   // ...........................................................................
   /**
-   * Retrieves a blob from the highest priority readable Bs instance.
-   * Hot-swaps the blob to all writable instances for caching.
-   * @param blobId - The blob identifier
-   * @param options - Download options
-   * @returns Promise resolving to blob content and properties
+   * Asks the readables in priority order until one answers.
+   *
+   * Skips sources it can see are closed, and sets aside a source that does not
+   * answer within {@link BLOB_SOURCE_TIMEOUT_MS} while a later one could —
+   * coming back to it when nobody else could help.
+   * @param what - `Blob` or `Block`, for the errors.
+   * @param id - The blob or block asked for, for the errors.
+   * @param ask - The question to one source.
+   * @returns The first answer and the id of the source that gave it.
    */
-  async getBlob(
-    blobId: string,
-    options?: DownloadBlobOptions,
-  ): Promise<{ content: Buffer; properties: BlobProperties }> {
+  private async _firstAnswer<T>(
+    what: 'Blob' | 'Block',
+    id: string,
+    ask: (bs: Bs) => Promise<T>,
+  ): Promise<{ value: T; sourceId: string }> {
     if (this.readables.length === 0) {
       throw new Error('No readable Bs available');
     }
 
-    type Answer = { content: Buffer; properties: BlobProperties };
-    let result: Answer | undefined;
-    let readFrom: string = '';
     const errors: unknown[] = [];
     const setAside: SetAside[] = [];
     let allClosed = true;
 
     // Try readables in priority order
-    for (let index = 0; index < this.readables.length; index++) {
-      const readable = this.readables[index];
+    const order = this._askOrder();
+    for (let index = 0; index < order.length; index++) {
+      const readable = order[index];
       if (this._isClosed(readable.bs)) {
         continue; // Skip known-closed peers instead of hanging on them
       }
       allClosed = false;
       try {
-        result = await this._bounded(
-          readable.bs.getBlob(blobId, options),
-          index,
-          readable.id,
-        );
-        readFrom = readable.id ?? '';
-        break; // Stop after first successful read
+        const value = await this._bounded(ask(readable.bs), order, index);
+        for (const aside of setAside) BsMulti._discard(aside.pending);
+        return { value, sourceId: readable.id ?? '' };
       } catch (e) {
         if (e instanceof SetAside) setAside.push(e);
         else errors.push(e);
@@ -311,125 +344,33 @@ export class BsMulti implements Bs {
 
     // Nobody else could answer, so come back to the sources that only lost
     // their turn. Each still carries its own request timeout.
-    if (!result) {
-      for (let i = 0; i < setAside.length; i++) {
-        try {
-          result = (await setAside[i].pending) as Answer;
-          readFrom = setAside[i].sourceId ?? '';
-          for (const rest of setAside.slice(i + 1)) {
-            BsMulti._discard(rest.pending);
-          }
-          break;
-        } catch (e) {
-          errors.push(e);
-        }
-      }
-    } else {
-      for (const aside of setAside) BsMulti._discard(aside.pending);
-    }
-
-    if (!result) {
-      if (allClosed) {
-        // No member was ever queried — this is a topology failure, not a
-        // verified absence, so it must not look like "Blob not found".
-        throw new Error('All readable Bs instances are closed');
-      }
-      BsMulti._throwExhausted(errors, blobId);
-    }
-
-    // Hot-swap: write blob to all writables (except source) for caching
-    if (this.writables.length > 0) {
-      /* v8 ignore start -- @preserve */
-      const hotSwapWrites = this.writables
-        .filter((writable) => writable.id !== readFrom)
-        .map(({ bs }) => bs.setBlob(result!.content).catch(() => {})); // Ignore cache write errors
-      /* v8 ignore stop -- @preserve */
-
-      await Promise.all(hotSwapWrites);
-    }
-
-    return result;
-  }
-
-  // ...........................................................................
-  /**
-   * Retrieves a blob as a ReadableStream from the highest priority readable Bs instance.
-   * @param blobId - The blob identifier
-   * @returns Promise resolving to a ReadableStream
-   */
-  async getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
-    if (this.readables.length === 0) {
-      throw new Error('No readable Bs available');
-    }
-
-    const errors: unknown[] = [];
-    const setAside: SetAside[] = [];
-    let allClosed = true;
-
-    // Try readables in priority order
-    for (let index = 0; index < this.readables.length; index++) {
-      const readable = this.readables[index];
-      if (this._isClosed(readable.bs)) {
-        continue; // Skip known-closed peers instead of hanging on them
-      }
-      allClosed = false;
-      try {
-        const stream = await this._bounded(
-          readable.bs.getBlobStream(blobId),
-          index,
-        );
-        for (const aside of setAside) BsMulti._discard(aside.pending);
-        return stream;
-      } catch (e) {
-        if (e instanceof SetAside) setAside.push(e);
-        else errors.push(e);
-        continue;
-      }
-    }
-
-    // Nobody else could answer — come back to the ones set aside.
     for (let i = 0; i < setAside.length; i++) {
       try {
-        const stream = (await setAside[i]
-          .pending) as ReadableStream<Uint8Array>;
+        const value = (await setAside[i].pending) as T;
         for (const rest of setAside.slice(i + 1)) {
           BsMulti._discard(rest.pending);
         }
-        return stream;
+        return { value, sourceId: setAside[i].sourceId ?? '' };
       } catch (e) {
         errors.push(e);
       }
     }
 
     if (allClosed) {
+      // No member was ever queried — this is a topology failure, not a
+      // verified absence, so it must not look like "not found".
       throw new Error('All readable Bs instances are closed');
     }
-    BsMulti._throwExhausted(errors, blobId);
+    BsMulti._throwExhausted(errors, what, id);
   }
 
   // ...........................................................................
   /**
-   * Deletes a blob from all writable Bs instances in parallel.
-   * @param blobId - The blob identifier
+   * Asks the readables in priority order whether one holds something.
+   * @param ask - The question to one source.
+   * @returns True as soon as one source says so.
    */
-  async deleteBlob(blobId: string): Promise<void> {
-    if (this.writables.length === 0) {
-      throw new Error('No writable Bs available');
-    }
-
-    // Delete from all writables in parallel
-    /* v8 ignore next -- @preserve */
-    const deletes = this.writables.map(({ bs }) => bs.deleteBlob(blobId));
-    await Promise.all(deletes);
-  }
-
-  // ...........................................................................
-  /**
-   * Checks if a blob exists in any readable Bs instance.
-   * @param blobId - The blob identifier
-   * @returns Promise resolving to true if blob exists in any readable
-   */
-  async blobExists(blobId: string): Promise<boolean> {
+  private async _anyHolds(ask: (bs: Bs) => Promise<boolean>): Promise<boolean> {
     if (this.readables.length === 0) {
       throw new Error('No readable Bs available');
     }
@@ -437,18 +378,15 @@ export class BsMulti implements Bs {
     // Check readables in priority order
     let allClosed = true;
     const setAside: SetAside[] = [];
-    for (let index = 0; index < this.readables.length; index++) {
-      const readable = this.readables[index];
+    const order = this._askOrder();
+    for (let index = 0; index < order.length; index++) {
+      const readable = order[index];
       if (this._isClosed(readable.bs)) {
         continue; // Skip known-closed peers instead of hanging on them
       }
       allClosed = false;
       try {
-        const exists = await this._bounded(
-          readable.bs.blobExists(blobId),
-          index,
-        );
-        if (exists) {
+        if (await this._bounded(ask(readable.bs), order, index)) {
           for (const aside of setAside) BsMulti._discard(aside.pending);
           return true;
         }
@@ -484,57 +422,185 @@ export class BsMulti implements Bs {
 
   // ...........................................................................
   /**
+   * Stores a blob read whole in every writable that lacks it. Its blocks are
+   * there already: {@link getBlock} keeps every block it reads elsewhere.
+   * A failure only means the cache stays incomplete, never a failed read.
+   * @param blobId - The blob.
+   * @param blocks - Its blocks, in order.
+   */
+  private async _keep(blobId: string, blocks: BlobBlock[]): Promise<void> {
+    await Promise.all(
+      this.writables.map(async ({ bs }) => {
+        try {
+          if (!(await bs.blobExists(blobId))) {
+            await bs.setBlobBlocks(blobId, blocks);
+          }
+        } catch {
+          // A cache that could not be completed is a cache, not a failure.
+        }
+      }),
+    );
+  }
+
+  // ...........................................................................
+  /**
+   * Retrieves a blob, block by block, each from the highest priority readable
+   * that holds it. A blob read whole is kept in the writables.
+   * @param blobId - The blob identifier
+   * @param options - Download options
+   * @returns Promise resolving to blob content and properties
+   */
+  async getBlob(
+    blobId: string,
+    options?: DownloadBlobOptions,
+  ): Promise<{ content: Buffer; properties: BlobProperties }> {
+    const properties = await this.getBlobProperties(blobId);
+    const blocks = await this.getBlobBlocks(blobId);
+    const content = await readBlocks(
+      blocks,
+      (blockId) => this.getBlock(blockId),
+      options?.range,
+    );
+    if (!options?.range) await this._keep(blobId, blocks);
+    return { content, properties };
+  }
+
+  // ...........................................................................
+  /**
+   * Retrieves a blob as a ReadableStream, block by block, each from the
+   * highest priority readable that holds it. Once the stream was read to its
+   * end, the blob is kept in the writables.
+   * @param blobId - The blob identifier
+   * @returns Promise resolving to a ReadableStream
+   */
+  async getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
+    const blocks = await this.getBlobBlocks(blobId);
+    return streamBlocks(
+      blobId,
+      blocks,
+      (blockId) => this.getBlock(blockId),
+      () => this._keep(blobId, blocks),
+    );
+  }
+
+  // ...........................................................................
+  /**
+   * Gets the blocks of a blob from the highest priority readable that has it.
+   * @param blobId - The blob identifier
+   * @returns Promise resolving to the blocks, in order
+   */
+  async getBlobBlocks(blobId: string): Promise<BlobBlock[]> {
+    return (
+      await this._firstAnswer('Blob', blobId, (bs) => bs.getBlobBlocks(blobId))
+    ).value;
+  }
+
+  // ...........................................................................
+  /**
+   * Gets one block from the highest priority readable that holds it, and
+   * keeps it in every writable except the one it came from.
+   * @param blockId - The block identifier
+   * @returns Promise resolving to the block's bytes
+   */
+  async getBlock(blockId: string): Promise<Buffer> {
+    const { value, sourceId } = await this._firstAnswer(
+      'Block',
+      blockId,
+      (bs) => bs.getBlock(blockId),
+    );
+    await Promise.all(
+      this.writables
+        .filter((writable) => writable.id !== sourceId)
+        .map(({ bs }) => bs.setBlock(value).catch(() => undefined)),
+    );
+    return value;
+  }
+
+  // ...........................................................................
+  /**
+   * Checks if a block exists in any readable Bs instance.
+   * @param blockId - The block identifier
+   * @returns Promise resolving to true if the block exists in any readable
+   */
+  async blockExists(blockId: string): Promise<boolean> {
+    return this._anyHolds((bs) => bs.blockExists(blockId));
+  }
+
+  // ...........................................................................
+  /**
+   * Stores one block in all writable Bs instances in parallel.
+   * @param content - The block's bytes
+   * @returns Promise resolving to the stored block
+   */
+  async setBlock(content: Buffer): Promise<BlobBlock> {
+    if (this.writables.length === 0) {
+      throw new Error('No writable Bs available');
+    }
+    const results = await Promise.all(
+      this.writables.map(({ bs }) => bs.setBlock(content)),
+    );
+    return results[0];
+  }
+
+  // ...........................................................................
+  /**
+   * Stores a blob made of held blocks in all writable Bs instances in
+   * parallel.
+   * @param blobId - The blob identifier
+   * @param blocks - Its blocks, in order
+   * @returns Promise resolving to blob properties
+   */
+  async setBlobBlocks(
+    blobId: string,
+    blocks: BlobBlock[],
+  ): Promise<BlobProperties> {
+    if (this.writables.length === 0) {
+      throw new Error('No writable Bs available');
+    }
+    const results = await Promise.all(
+      this.writables.map(({ bs }) => bs.setBlobBlocks(blobId, blocks)),
+    );
+    return results[0];
+  }
+
+  // ...........................................................................
+  /**
+   * Deletes a blob from all writable Bs instances in parallel.
+   * @param blobId - The blob identifier
+   */
+  async deleteBlob(blobId: string): Promise<void> {
+    if (this.writables.length === 0) {
+      throw new Error('No writable Bs available');
+    }
+
+    // Delete from all writables in parallel
+    /* v8 ignore next -- @preserve */
+    const deletes = this.writables.map(({ bs }) => bs.deleteBlob(blobId));
+    await Promise.all(deletes);
+  }
+
+  // ...........................................................................
+  /**
+   * Checks if a blob exists in any readable Bs instance.
+   * @param blobId - The blob identifier
+   * @returns Promise resolving to true if blob exists in any readable
+   */
+  async blobExists(blobId: string): Promise<boolean> {
+    return this._anyHolds((bs) => bs.blobExists(blobId));
+  }
+
+  // ...........................................................................
+  /**
    * Gets blob properties from the highest priority readable Bs instance.
    * @param blobId - The blob identifier
    * @returns Promise resolving to blob properties
    */
   async getBlobProperties(blobId: string): Promise<BlobProperties> {
-    if (this.readables.length === 0) {
-      throw new Error('No readable Bs available');
-    }
-
-    const errors: unknown[] = [];
-    const setAside: SetAside[] = [];
-    let allClosed = true;
-
-    // Try readables in priority order
-    for (let index = 0; index < this.readables.length; index++) {
-      const readable = this.readables[index];
-      if (this._isClosed(readable.bs)) {
-        continue; // Skip known-closed peers instead of hanging on them
-      }
-      allClosed = false;
-      try {
-        const properties = await this._bounded(
-          readable.bs.getBlobProperties(blobId),
-          index,
-        );
-        for (const aside of setAside) BsMulti._discard(aside.pending);
-        return properties;
-      } catch (e) {
-        if (e instanceof SetAside) setAside.push(e);
-        else errors.push(e);
-        continue;
-      }
-    }
-
-    // Nobody else could answer — come back to the ones set aside.
-    for (let i = 0; i < setAside.length; i++) {
-      try {
-        const properties = (await setAside[i].pending) as BlobProperties;
-        for (const rest of setAside.slice(i + 1)) {
-          BsMulti._discard(rest.pending);
-        }
-        return properties;
-      } catch (e) {
-        errors.push(e);
-      }
-    }
-
-    if (allClosed) {
-      throw new Error('All readable Bs instances are closed');
-    }
-    BsMulti._throwExhausted(errors, blobId);
+    return (
+      await this._firstAnswer('Blob', blobId, (bs) =>
+        bs.getBlobProperties(blobId),
+      )
+    ).value;
   }
 
   // ...........................................................................

@@ -4,7 +4,7 @@
 // Use of this source code is governed by terms that can be
 // found in the LICENSE file in the root of this package.
 
-import { Bs, DownloadBlobOptions, ListBlobsOptions } from './bs.ts';
+import { BlobBlock, Bs, ListBlobsOptions } from './bs.ts';
 import { Socket } from './socket.ts';
 
 /**
@@ -107,26 +107,26 @@ export class BsServer {
    */
   private _generateTransportLayerCRUD = () =>
     ({
-      setBlob: (content: Buffer | string | ReadableStream) =>
-        this._bs.setBlob(content),
-      getBlob: (blobId: string, options?: DownloadBlobOptions) =>
-        this._bs.getBlob(blobId, options),
-      // **No `getBlobStream` here, on purpose.** It used to be, and it could
-      // never answer: an acknowledgement crosses the wire as data, and a
-      // `ReadableStream` is a live object with a reader, a queue and a lock.
-      // On socket.io it arrived as `{}`. `BsPeer` now builds the stream on its
-      // own side out of ranged `getBlob` calls, so the bytes cross as bytes and
-      // a chunk at a time — which is also what keeps a hub from holding a whole
-      // blob while it serves one.
+      // **Bytes cross only as blocks.** No `setBlob` or `getBlob` here: a
+      // whole blob in one message is bounded by nothing but its file, and
+      // a socket closes the connection on a message above its cap. `BsPeer`
+      // cuts and assembles blobs on its own side and sends or asks for one
+      // block per message. No `getBlobStream` either: a stream cannot cross
+      // in an acknowledgement.
+      getBlobBlocks: (blobId: string) => this._bs.getBlobBlocks(blobId),
+      getBlock: (blockId: string) => this._bs.getBlock(blockId),
+      blockExists: (blockId: string) => this._bs.blockExists(blockId),
+      setBlock: (content: Buffer) => this._bs.setBlock(content),
+      setBlobBlocks: (blobId: string, blocks: BlobBlock[]) =>
+        this._bs.setBlobBlocks(blobId, blocks),
       deleteBlob: (blobId: string) => this._bs.deleteBlob(blobId),
       blobExists: (blobId: string) => this._bs.blobExists(blobId),
-      getBlobProperties: (blobId: string) =>
-        this._bs.getBlobProperties(blobId),
+      getBlobProperties: (blobId: string) => this._bs.getBlobProperties(blobId),
       listBlobs: (options?: ListBlobsOptions) => this._bs.listBlobs(options),
       generateSignedUrl: (
         blobId: string,
         expiresIn: number,
         permissions?: 'read' | 'delete',
       ) => this._bs.generateSignedUrl(blobId, expiresIn, permissions),
-    } as { [key: string]: (...args: unknown[]) => Promise<unknown> });
+    }) as { [key: string]: (...args: unknown[]) => Promise<unknown> };
 }

@@ -45,10 +45,13 @@ describe('BsPeerBridge', () => {
       const onSpy = vi.spyOn(socket, 'on');
       bridge.start();
 
-      // Only read operations should be registered (PULL-only). No
-      // 'getBlobStream': a stream cannot cross a socket in an ack.
+      // Only read operations should be registered (PULL-only). Bytes cross
+      // as blocks: no 'getBlob' (a whole blob in one message) and no
+      // 'getBlobStream' (a stream cannot cross a socket in an ack).
       const readMethods = [
-        'getBlob',
+        'getBlobBlocks',
+        'getBlock',
+        'blockExists',
         'blobExists',
         'getBlobProperties',
         'listBlobs',
@@ -58,8 +61,15 @@ describe('BsPeerBridge', () => {
         expect(onSpy).toHaveBeenCalledWith(method, expect.any(Function));
       }
 
-      // Write operations should NOT be registered
-      const writeMethods = ['setBlob', 'deleteBlob', 'generateSignedUrl'];
+      // Write operations and whole-blob reads should NOT be registered
+      const writeMethods = [
+        'getBlob',
+        'setBlob',
+        'setBlock',
+        'setBlobBlocks',
+        'deleteBlob',
+        'generateSignedUrl',
+      ];
       for (const method of writeMethods) {
         const calls = onSpy.mock.calls.filter((call) => call[0] === method);
         expect(calls.length).toBe(0);
@@ -115,14 +125,15 @@ describe('BsPeerBridge', () => {
         callbackResult = result;
       };
 
-      // Trigger a read event (getBlob is registered)
-      socket.emit('getBlob', blobId, callback);
+      // Trigger a read event (getBlock is registered)
+      const [{ blockId }] = await bs.getBlobBlocks(blobId);
+      socket.emit('getBlock', blockId, callback);
 
       // Wait for async callback
       await new Promise((resolve) => setTimeout(resolve, 10));
 
       expect(callbackResult).toBeDefined();
-      expect(callbackResult.content.toString()).toBe('Test content');
+      expect(callbackResult.toString()).toBe('Test content');
       expect(callbackError).toBeNull();
     });
 
@@ -137,8 +148,8 @@ describe('BsPeerBridge', () => {
         callbackResult = result;
       };
 
-      // Trigger getBlob with non-existent blobId
-      socket.emit('getBlob', 'nonexistent-blob-id', callback);
+      // Trigger getBlobBlocks with non-existent blobId
+      socket.emit('getBlobBlocks', 'nonexistent-blob-id', callback);
 
       // Wait for async callback
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -188,9 +199,9 @@ describe('BsPeerBridge', () => {
       bridge.start();
       const offSpy = vi.spyOn(socket, 'off');
 
-      bridge.unregisterEvent('getBlob');
+      bridge.unregisterEvent('getBlock');
 
-      expect(offSpy).toHaveBeenCalledWith('getBlob', expect.any(Function));
+      expect(offSpy).toHaveBeenCalledWith('getBlock', expect.any(Function));
     });
 
     it('should not throw if event does not exist', () => {
@@ -201,14 +212,14 @@ describe('BsPeerBridge', () => {
 
     it('should prevent events from firing after unregistration', async () => {
       bridge.start();
-      bridge.unregisterEvent('getBlob');
+      bridge.unregisterEvent('getBlock');
 
       let callbackCalled = false;
       const callback = () => {
         callbackCalled = true;
       };
 
-      socket.emit('getBlob', 'some-blob-id', callback);
+      socket.emit('getBlock', 'some-block-id', callback);
 
       // Wait a bit
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -360,7 +371,8 @@ describe('BsPeerBridge', () => {
       let error: any;
 
       // Simulate server querying this client via socket
-      socket.emit('getBlob', blobId, (err: any, res: any) => {
+      const [{ blockId }] = await bs.getBlobBlocks(blobId);
+      socket.emit('getBlock', blockId, (err: any, res: any) => {
         result = res;
         error = err;
       });
@@ -369,13 +381,20 @@ describe('BsPeerBridge', () => {
 
       // ✅ Should return blob from injected bs instance (not from any server/global Bs)
       expect(result).toBeDefined();
-      expect(result.content.toString()).toBe('client local content');
+      expect(result.toString()).toBe('client local content');
       expect(error).toBeNull();
     });
 
     it('should only expose read operations (PULL-only architecture)', () => {
-      // Verify write operations are NOT registered
-      const writeOperations = ['setBlob', 'deleteBlob', 'generateSignedUrl'];
+      // Verify write operations and whole-blob reads are NOT registered
+      const writeOperations = [
+        'getBlob',
+        'setBlob',
+        'setBlock',
+        'setBlobBlocks',
+        'deleteBlob',
+        'generateSignedUrl',
+      ];
 
       for (const operation of writeOperations) {
         let handlerCalled = false;
@@ -389,7 +408,9 @@ describe('BsPeerBridge', () => {
 
       // Verify read operations ARE registered
       const readOperations = [
-        'getBlob',
+        'getBlobBlocks',
+        'getBlock',
+        'blockExists',
         'blobExists',
         'getBlobProperties',
         'listBlobs',
@@ -402,22 +423,36 @@ describe('BsPeerBridge', () => {
       }
     });
 
-    it('should handle getBlob through socket', async () => {
+    it('should handle getBlobBlocks through socket', async () => {
       const { blobId } = await bs.setBlob('Get test');
 
       let result: any;
       let error: any;
 
-      socket.emit('getBlob', blobId, (err: any, res: any) => {
+      socket.emit('getBlobBlocks', blobId, (err: any, res: any) => {
         result = res;
         error = err;
       });
 
       await new Promise((resolve) => setTimeout(resolve, 10));
 
-      expect(result).toBeDefined();
-      expect(result.content.toString()).toBe('Get test');
+      expect(result).toEqual(await bs.getBlobBlocks(blobId));
       expect(error).toBeNull();
+    });
+
+    it('should handle blockExists through socket', async () => {
+      const { blobId } = await bs.setBlob('Block test');
+      const [{ blockId }] = await bs.getBlobBlocks(blobId);
+
+      let result: any;
+
+      socket.emit('blockExists', blockId, (_err: any, res: any) => {
+        result = res;
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      expect(result).toBe(true);
     });
 
     it('should handle blobExists through socket', async () => {
@@ -502,14 +537,14 @@ describe('BsPeerBridge', () => {
 
       // This shouldn't throw even if callback is not provided
       expect(() => {
-        socket.emit('getBlob', blobId, 'not-a-function');
+        socket.emit('getBlobBlocks', blobId, 'not-a-function');
       }).not.toThrow();
     });
 
     it('should handle empty arguments', async () => {
       let error: any;
 
-      socket.emit('getBlob', (err: any) => {
+      socket.emit('getBlobBlocks', (err: any) => {
         error = err;
       });
 

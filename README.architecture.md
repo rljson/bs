@@ -315,58 +315,13 @@ It used to be, and it could never answer. An acknowledgement crosses the wire as
 data; a `ReadableStream` is a live object with a reader, a queue and a lock. On
 socket.io it arrived as `{}`.
 
-`BsPeer.getBlobStream` now builds the stream on its own side out of ranged
-`getBlob` calls, `BLOB_CHUNK_BYTES` (4 MB) at a time. `DownloadBlobOptions.range`
-was already on the interface and `BsFs` was already honouring it with a positioned
-read off disk.
-
-Pull-based deliberately: the consumer's pace is the flow control, so there is no
-window, no credit protocol and no per-stream state on the server. Each pull is an
-ordinary request, which also means each one passes a hub's serving gate on its
-own — that is what makes the gate bound chunk-sized work instead of blob-sized.
-A whole-blob read cost the server the entire file in a Buffer plus the parser's
-copy, and the consumer the same again; it also could not exceed the transport's
-50 MB message cap at all.
-
-**Implementation:**
-```typescript
-private _registerBsMethods(): void {
-  const bsMethods = [
-    'getBlob',           // ✅ READ
-    'blobExists',        // ✅ READ
-    'getBlobProperties', // ✅ READ
-    'listBlobs',         // ✅ READ
-    // NOT: 'setBlob', 'deleteBlob', 'generateSignedUrl'
-  ];
-
-  for (const methodName of bsMethods) {
-    this.registerEvent(methodName);
-  }
-}
-```
-
-**Callback Pattern (Error-First):**
-```typescript
-const handler = (...args: any[]) => {
-  const callback = args[args.length - 1];
-  const methodArgs = args.slice(0, -1);
-
-  bsMethod.apply(this._bs, methodArgs)
-    .then((result) => {
-      callback(null, result);  // ✅ Error-first: (error, result)
-    })
-    .catch((error) => {
-      callback(error, null);   // ✅ Error-first: (error, result)
-    });
-};
-```
-
-**Why Read-Only?**
-
-1. **Security**: Prevents server from pushing malicious data to clients
-2. **Architectural Clarity**: Clear unidirectional data flow (PULL)
-3. **Consistency with IoPeerBridge**: Matches the pattern from `@rljson/io`
-4. **Client Control**: Client owns its local storage, server can only read
+`BsPeer.getBlobStream` builds the stream on its own side, one `getBlock` at a
+time (see [Blocks](#blocks)). Pull-based deliberately: the consumer's pace is
+the flow control, so there is no window, no credit protocol and no per-stream
+state on the server. Each block is an ordinary request, which also means each
+one passes a hub's serving gate on its own — that is what makes the gate bound
+block-sized work instead of blob-sized. `getBlob` is not a wire method either:
+a whole blob in one message cannot exceed the transport's message cap.
 
 #### 6. **BsMulti** (`bs-multi.ts`)
 
@@ -390,42 +345,24 @@ type BsMultiBs = {
 };
 ```
 
-**Read Strategy:**
-1. Sort stores by priority (ascending)
-2. Try each readable store in order
-3. First successful read wins
-4. Hot-swap: Write to all writable stores for caching
-5. Return result
+**Read Strategy (block by block):**
+1. Ask the readables for the blob's block list, in priority order
+2. Ask for each block the same way: a block a writable already holds is never
+   fetched again, so a new version of a file costs only its changed blocks
+3. Keep every block read elsewhere in every writable except its source
+4. Once a blob was read whole (`getBlob` without a range, or a stream read to
+   its end), store its block list in every writable that lacks it
+
+A source that does not answer within `BLOB_SOURCE_TIMEOUT_MS` while another
+could is set aside — asked again only when nobody else answered — and asked
+after all others for `SLOW_SOURCE_MEMORY_MS`, so a silent source costs one
+bound per read rather than one per block.
 
 **Write Strategy:**
 1. Collect all writable stores
 2. Write to all in parallel using `Promise.all`
 3. All writes must succeed (or error)
 4. Content-addressable ensures consistency
-
-**Hot-Swapping:**
-```typescript
-async getBlob(blobId: string): Promise<{ content: Buffer; properties: BlobProperties }> {
-  // Try stores in priority order
-  for (const readable of this.readables) {
-    try {
-      result = await readable.bs.getBlob(blobId);
-      readFrom = readable.id;
-      break;
-    } catch (e) {
-      continue;
-    }
-  }
-
-  // Hot-swap: Cache in all writables (except source)
-  const hotSwapWrites = this.writables
-    .filter((writable) => writable.id !== readFrom)
-    .map(({ bs }) => bs.setBlob(result.content).catch(() => {}));
-
-  await Promise.all(hotSwapWrites);
-  return result;
-}
-```
 
 **List Strategy (Deduplication):**
 ```typescript
@@ -451,69 +388,76 @@ async listBlobs(): Promise<ListBlobsResult> {
 
 ### SHA256 Hashing
 
-Content addressing uses SHA256 to generate a unique identifier for each blob.
+Every blob and every block is identified by the SHA256 of its bytes, in
+base64url, cut to 22 characters — the id `@rljson/hash`'s `hshBuffer` gives.
+`ContentId` computes it incrementally, so a stream never has to be held
+whole:
 
-**Hash Calculation:**
 ```typescript
-import { createHash } from 'crypto';
+import { ContentId } from '@rljson/bs';
 
-function calculateBlobId(content: Buffer): string {
-  return createHash('sha256').update(content).digest('hex');
-}
+ContentId.of(bytes); // the id of some bytes
+new ContentId().update(first).update(rest).digest(); // the same, in pieces
 ```
 
-**Properties:**
-- **Deterministic**: Same content always produces same hash
-- **Collision-Resistant**: Practically impossible to find two different contents with same hash
-- **Fixed Length**: Always 64 hexadecimal characters (256 bits)
-- **One-Way**: Cannot derive content from hash
+### Blocks
 
-### Deduplication Mechanics
+**Every blob is stored as blocks.** `forEachBlock` cuts content at
+boundaries the content decides — FastCDC with normalized chunking, a 32-bit
+gear hash over a fixed table:
 
-**Automatic Deduplication:**
-```typescript
-async setBlob(content: Buffer | string | ReadableStream): Promise<BlobProperties> {
-  const buffer = await this.toBuffer(content);
-  const blobId = hshBuffer(buffer);
+| | |
+| --- | --- |
+| `BLOCK_MIN_BYTES` | 256 KB — only the last block of a blob may be smaller |
+| `BLOCK_AVG_BYTES` | 1 MB — what the boundaries aim for |
+| `BLOCK_MAX_BYTES` | 4 MB — the largest block, and the largest message a blob needs |
 
-  // Check if blob already exists
-  const existing = this.blobs.get(blobId);
-  if (existing) {
-    return existing.properties;  // Return existing, don't store again
-  }
+A change inside a file moves only the boundaries next to it — whether bytes
+were overwritten, inserted or removed — so two versions of a file share
+every block the change did not touch. Measured on 24 MB of noise: a 100-byte
+overwrite, a 5 KB insertion, a 5 KB removal and 77 bytes prepended each leave
+at most three new blocks.
 
-  // Store new blob
-  const properties: BlobProperties = {
-    blobId,
-    size: buffer.length,
-    createdAt: new Date(),
-  };
+A blob is its block list: `BlobLayout { blobId, size, blocks }`, where
+`blobId` is still the hash of the whole content. A store keeps each block
+once, however many blobs contain it:
 
-  this.blobs.set(blobId, { content: buffer, properties });
-  return properties;
-}
+```text
+setBlob(content)
+  └─ writeBlocks(content, putBlock)
+       ├─ forEachBlock: cut, one block at a time
+       ├─ ContentId.of(block) → blockId; putBlock stores it unless held
+       └─ ContentId over everything → blobId
+  └─ store the block list under blobId
 ```
 
-**Benefits in Multi-Tier:**
-```typescript
-// Same content stored in multiple tiers = same blobId
-// BsMulti writes to all writables, but no duplicate storage cost
-// because content-addressable storage deduplicates automatically
+The sizes, the gear table and the masks decide every boundary. Changing them
+breaks nothing — a reader always follows the block list of the store it
+reads from — but blocks cut before the change are no longer shared with
+blocks cut after it.
 
-await bsMulti.setBlob('same content');  // Writes to tier1, tier2
-await bsMulti.setBlob('same content');  // No-op (already exists)
-```
+### The block calls of `Bs`
+
+| Call | |
+| --- | --- |
+| `getBlobBlocks(blobId)` | the blob's blocks, in order |
+| `getBlock(blockId)` | one block's bytes |
+| `blockExists(blockId)` | whether the store holds a block |
+| `setBlock(content)` | store one block, id from its bytes |
+| `setBlobBlocks(blobId, blocks)` | store a blob from held blocks; refused unless they hash to `blobId` |
+
+`getBlob`, `getBlobStream` and ranges are built on them with `readBlocks`
+(only the blocks a range touches are read) and `streamBlocks` (one block at
+a time; the stream fails at its end unless the bytes hash to `blobId`).
+Deleting a blob deletes its block list; its blocks stay, other blobs may
+contain them.
 
 ### Content Verification
 
-Any party can verify content integrity:
-
-```typescript
-async verifyBlob(blobId: string, content: Buffer): boolean {
-  const computedId = calculateBlobId(content);
-  return computedId === blobId;
-}
-```
+Nothing is trusted on arrival: `BsPeer.getBlock` checks every block against
+its id (`verifyBlock`), every stream checks the whole blob at its end, and
+`setBlobBlocks` refuses blocks that do not make the blob (`verifyBlob`). A
+blob is only ever stored under the hash of its content.
 
 ## Network Architecture
 
@@ -542,51 +486,47 @@ export interface Socket {
 
 ### Protocol
 
+**Bytes cross only as blocks, one block per message.** A whole blob in one
+message is bounded by nothing but its file, and a socket closes the
+connection on a message above its cap. So `BsServer` answers
+`getBlobBlocks`, `getBlock`, `blockExists`, `setBlock`, `setBlobBlocks`,
+`getBlobProperties`, `blobExists`, `listBlobs`, `deleteBlob` and
+`generateSignedUrl` — and neither `getBlob` nor `setBlob`. `BsPeerBridge`
+answers the reads among them.
+
 **Message Format (Socket Events):**
 ```
 Event: <methodName>
 Args: [...methodArgs, callback]
 
 Example:
-socket.emit('getBlob', blobId, options, (error, result) => {
-  if (error) console.error(error);
-  else console.log(result);
-});
+socket.emit('getBlock', blockId, (error, bytes) => { … });
 ```
 
 **Error-First Callbacks:**
 ```typescript
 callback(error: Error | null, result?: T);
-
-// Success
-callback(null, { content: buffer, properties: props });
-
-// Error
-callback(new Error('Blob not found'), null);
 ```
 
 ### Client-Server Flow
 
-**Complete Request/Response Cycle:**
+**Reading a blob (`BsPeer.getBlobStream`):**
 ```
-1. Client: BsPeer.getBlob(blobId)
-   ├─> Create promise
-   └─> socket.emit('getBlob', blobId, callback)
-
-2. Network: Transport socket event
-
-3. Server: BsServer receives 'getBlob' event
-   ├─> Extract args and callback
-   ├─> Call underlying bs.getBlob(blobId)
-   ├─> Wait for result
-   └─> Invoke callback(null, result)
-
-4. Network: Transport callback response
-
-5. Client: BsPeer callback invoked
-   ├─> Resolve or reject promise
-   └─> Return to caller
+1. emit('getBlobBlocks', blobId)        → the block list
+2. per block, as the consumer reads on:
+   emit('getBlock', blockId)           → ≤ 4 MB, checked against blockId
+3. at the end: the bytes must hash to blobId, or the stream fails
 ```
+
+**Storing a blob (`BsPeer.setBlob`):**
+```
+1. cut the content into blocks here
+2. per block: emit('blockExists') — and emit('setBlock') only if missing
+3. emit('setBlobBlocks', blobId, blocks) → refused unless they make blobId
+```
+
+The consumer's pace is the flow control: the next block is asked for when
+the consumer reads on, so neither side holds more than a block.
 
 ### Request Timeouts & Fail-Fast (BsPeer)
 
@@ -763,52 +703,35 @@ Priority 2 (Lowest)
    └─ Largest, slowest, persistent
 ```
 
-### Read Path with Hot-Swapping
+### Read Path: Block by Block, Keeping Every Block
 
 ```
-1. Request: getBlob(blobId)
+1. Request: getBlob(blobId) or getBlobStream(blobId)
 
-2. Check Priority 0 (cache)
-   ├─ HIT: Return immediately ✅
-   └─ MISS: Continue to Priority 1
+2. getBlobBlocks(blobId): Priority 0, then 1, then 2 — first answer wins
 
-3. Check Priority 1 (network)
-   ├─ HIT:
-   │  ├─ Return content
-   │  └─ Hot-swap to Priority 0 (cache for next time)
-   └─ MISS: Continue to Priority 2
+3. For each block:
+   ├─ Priority 0 holds it: read it there ✅
+   └─ else the next priority that holds it:
+      ├─ read it (checked against its id by BsPeer)
+      └─ keep it in every writable except the source
 
-4. Check Priority 2 (backup)
-   ├─ HIT:
-   │  ├─ Return content
-   │  └─ Hot-swap to Priority 0 and 1
-   └─ MISS: Throw "Blob not found"
+4. Read whole: store the block list in every writable that lacks it
 ```
+
+A new version of a file that shares most of its blocks with one already in
+Priority 0 costs only the blocks Priority 0 lacks.
 
 **Code:**
 ```typescript
-async getBlob(blobId: string): Promise<{ content: Buffer; properties: BlobProperties }> {
-  for (const readable of this.readables) {
-    try {
-      result = await readable.bs.getBlob(blobId);
-      readFrom = readable.id;
-      break;
-    } catch (e) {
-      continue;  // Try next priority
-    }
-  }
-
-  if (!result) {
-    throw new Error(`Blob not found: ${blobId}`);
-  }
-
-  // Hot-swap to all writables (except source)
-  const hotSwapWrites = this.writables
-    .filter((writable) => writable.id !== readFrom)
-    .map(({ bs }) => bs.setBlob(result.content).catch(() => {}));
-
-  await Promise.all(hotSwapWrites);
-  return result;
+async getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
+  const blocks = await this.getBlobBlocks(blobId);
+  return streamBlocks(
+    blobId,
+    blocks,
+    (blockId) => this.getBlock(blockId), // cascade + keep
+    () => this._keep(blobId, blocks), // store the blob once read whole
+  );
 }
 ```
 

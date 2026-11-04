@@ -48,16 +48,19 @@ describe('BsServer', () => {
       const socket2 = new SocketMock();
       await server.addSocket(socket2);
       // The transport layer registered a listener per CRUD event.
-      expect(socket2.listenerCount('getBlob')).toBeGreaterThan(0);
-      expect(socket2.listenerCount('setBlob')).toBeGreaterThan(0);
+      expect(socket2.listenerCount('getBlock')).toBeGreaterThan(0);
+      expect(socket2.listenerCount('setBlock')).toBeGreaterThan(0);
+      // No whole blob in one message, in either direction.
+      expect(socket2.listenerCount('getBlob')).toBe(0);
+      expect(socket2.listenerCount('setBlob')).toBe(0);
 
       server.removeSocket(socket2);
 
       // After removal every CRUD listener is gone — the socket no longer
       // reacts to blob events (no leak, no duplicate execution when several
       // BsServers shared the socket).
-      expect(socket2.listenerCount('getBlob')).toBe(0);
-      expect(socket2.listenerCount('setBlob')).toBe(0);
+      expect(socket2.listenerCount('getBlock')).toBe(0);
+      expect(socket2.listenerCount('setBlock')).toBe(0);
       expect(socket2.listenerCount('listBlobs')).toBe(0);
     });
 

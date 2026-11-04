@@ -4,119 +4,149 @@
 // Use of this source code is governed by terms that can be
 // found in the LICENSE file in the root of this package.
 
-import { hshBuffer } from '@rljson/hash';
-
-import { Readable } from 'node:stream';
+import {
+  readBlocks,
+  streamBlocks,
+  verifyBlob,
+  writeBlocks,
+  ContentId,
+} from './blob-blocks.ts';
 
 import type {
+  BlobBlock,
   BlobProperties,
   Bs,
   DownloadBlobOptions,
   ListBlobsOptions,
   ListBlobsResult,
 } from './bs.js';
+
 interface StoredBlob {
-  content: Buffer;
+  blocks: BlobBlock[];
   properties: BlobProperties;
 }
 
 /**
  * In-memory implementation of content-addressable blob storage.
- * All blobs are stored in memory using a Map.
+ * All blocks and blobs are stored in memory using Maps.
  * Useful for testing and development.
  */
 export class BsMem implements Bs {
   private readonly blobs = new Map<string, StoredBlob>();
+  private readonly blocks = new Map<string, Buffer>();
 
   /**
-   * Convert content to Buffer
-   * @param content - Content to convert (Buffer, string, or ReadableStream)
+   * Reads one stored block.
+   * @param blockId - The block.
+   * @returns Its bytes.
    */
-  private async toBuffer(
-    content: Buffer | string | ReadableStream,
-  ): Promise<Buffer> {
-    if (Buffer.isBuffer(content)) {
-      return content;
+  private readonly _readBlock = async (blockId: string): Promise<Buffer> => {
+    const bytes = this.blocks.get(blockId);
+    if (!bytes) {
+      throw new Error(`Block not found: ${blockId}`);
     }
+    return bytes;
+  };
 
-    if (typeof content === 'string') {
-      return Buffer.from(content, 'utf8');
+  /**
+   * The stored blob, or an error naming it.
+   * @param blobId - The blob.
+   */
+  private _stored(blobId: string): StoredBlob {
+    const stored = this.blobs.get(blobId);
+    if (!stored) {
+      throw new Error(`Blob not found: ${blobId}`);
     }
+    return stored;
+  }
 
-    // Handle ReadableStream
-    const reader = content.getReader();
-    const chunks: Uint8Array[] = [];
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
+  /**
+   * Stores a blob's block list unless the blob is stored already.
+   * @param blobId - The blob.
+   * @param size - Its size.
+   * @param blocks - Its blocks, all stored.
+   * @returns The blob's properties.
+   */
+  private _storeBlob(
+    blobId: string,
+    size: number,
+    blocks: BlobBlock[],
+  ): BlobProperties {
+    const existing = this.blobs.get(blobId);
+    if (existing) {
+      return existing.properties;
     }
-
-    return Buffer.concat(chunks);
+    const properties: BlobProperties = { blobId, size, createdAt: new Date() };
+    this.blobs.set(blobId, { blocks, properties });
+    return properties;
   }
 
   async setBlob(
     content: Buffer | string | ReadableStream,
   ): Promise<BlobProperties> {
-    const buffer = await this.toBuffer(content);
-    const blobId = hshBuffer(buffer);
-
-    // Check if blob already exists (deduplication)
-    const existing = this.blobs.get(blobId);
-    if (existing) {
-      return existing.properties;
-    }
-
-    // Store new blob
-    const properties: BlobProperties = {
-      blobId,
-      size: buffer.length,
-      createdAt: new Date(),
-    };
-
-    this.blobs.set(blobId, {
-      content: buffer,
-      properties,
-    });
-
-    return properties;
+    const { blobId, size, blocks } = await writeBlocks(
+      content,
+      async ({ blockId }, bytes) => {
+        // A copy: the bytes may be a view into a much larger buffer.
+        if (!this.blocks.has(blockId)) {
+          this.blocks.set(blockId, Buffer.from(bytes));
+        }
+      },
+    );
+    return this._storeBlob(blobId, size, blocks);
   }
 
   async getBlob(
     blobId: string,
     options?: DownloadBlobOptions,
   ): Promise<{ content: Buffer; properties: BlobProperties }> {
-    const stored = this.blobs.get(blobId);
-    if (!stored) {
-      throw new Error(`Blob not found: ${blobId}`);
-    }
-
-    let content = stored.content;
-
-    // Handle range request
-    if (options?.range) {
-      const { start, end } = options.range;
-      content = stored.content.subarray(start, end);
-    }
-
-    return {
-      content,
-      properties: stored.properties,
-    };
+    const { blocks, properties } = this._stored(blobId);
+    const content = await readBlocks(blocks, this._readBlock, options?.range);
+    return { content, properties };
   }
 
   async getBlobStream(blobId: string): Promise<ReadableStream> {
-    const stored = this.blobs.get(blobId);
-    if (!stored) {
-      throw new Error(`Blob not found: ${blobId}`);
-    }
-
-    // Convert Buffer to ReadableStream
-    const nodeStream = Readable.from(stored.content);
-    return Readable.toWeb(nodeStream) as ReadableStream;
+    const { blocks } = this._stored(blobId);
+    return streamBlocks(blobId, blocks, this._readBlock);
   }
 
+  async getBlobBlocks(blobId: string): Promise<BlobBlock[]> {
+    return this._stored(blobId).blocks;
+  }
+
+  async getBlock(blockId: string): Promise<Buffer> {
+    return this._readBlock(blockId);
+  }
+
+  async blockExists(blockId: string): Promise<boolean> {
+    return this.blocks.has(blockId);
+  }
+
+  async setBlock(content: Buffer): Promise<BlobBlock> {
+    const blockId = ContentId.of(content);
+    if (!this.blocks.has(blockId)) {
+      this.blocks.set(blockId, Buffer.from(content));
+    }
+    return { blockId, size: content.length };
+  }
+
+  async setBlobBlocks(
+    blobId: string,
+    blocks: BlobBlock[],
+  ): Promise<BlobProperties> {
+    const existing = this.blobs.get(blobId);
+    if (existing) {
+      return existing.properties;
+    }
+    const size = await verifyBlob(blobId, blocks, this._readBlock);
+    return this._storeBlob(blobId, size, blocks);
+  }
+
+  /**
+   * Deletes a blob's block list. Its blocks stay: other blobs may contain
+   * them.
+   * @param blobId - The blob.
+   */
   async deleteBlob(blobId: string): Promise<void> {
     const deleted = this.blobs.delete(blobId);
     if (!deleted) {
@@ -196,10 +226,18 @@ export class BsMem implements Bs {
   }
 
   /**
-   * Clear all blobs from storage (useful for testing)
+   * Clear all blobs and blocks from storage (useful for testing)
    */
   clear(): void {
     this.blobs.clear();
+    this.blocks.clear();
+  }
+
+  /**
+   * Get the number of blocks in storage
+   */
+  get blockCount(): number {
+    return this.blocks.size;
   }
 
   /**

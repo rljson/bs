@@ -567,7 +567,7 @@ describe('BsMulti', () => {
       const failingStore = new BsMem();
 
       // Make store throw non-"not found" error
-      failingStore.getBlob = async () => {
+      failingStore.getBlobProperties = async () => {
         throw new Error('Network timeout');
       };
 
@@ -703,7 +703,7 @@ describe('BsMulti', () => {
       const failingStore = new BsMem();
 
       // Make store throw non-"not found" error
-      failingStore.getBlobStream = async () => {
+      failingStore.getBlobBlocks = async () => {
         throw new Error('Stream error');
       };
 
@@ -771,10 +771,10 @@ describe('BsMulti', () => {
 
     it('should preserve sequential priority order when skipping closed members', async () => {
       const closed = await closedPeer();
-      const closedGetBlobSpy = vi.spyOn(closed, 'getBlob');
+      const closedGetBlobSpy = vi.spyOn(closed, 'getBlobBlocks');
 
       const missingStore = new BsMem(); // Open, but does not have the blob
-      const missingGetBlobSpy = vi.spyOn(missingStore, 'getBlob');
+      const missingGetBlobSpy = vi.spyOn(missingStore, 'getBlobBlocks');
       const hittingStore = new BsMem();
       const { blobId } = await hittingStore.setBlob('Third in line');
 
@@ -792,7 +792,7 @@ describe('BsMulti', () => {
       // ...while priority 1 (open, but missing the blob) WAS queried and
       // missed before priority 2 succeeded — proving sequential order was
       // preserved despite the closed member being skipped.
-      expect(missingGetBlobSpy).toHaveBeenCalledWith(blobId, undefined);
+      expect(missingGetBlobSpy).toHaveBeenCalledWith(blobId);
     });
 
     it('should skip a closed readable in getBlobStream and serve from the next open member', async () => {
@@ -929,9 +929,9 @@ describe('BsMulti', () => {
       ]);
       await multi.init();
 
-      await expect(
-        multi.generateSignedUrl('any-id', 3600),
-      ).rejects.toThrow('All readable Bs instances are closed');
+      await expect(multi.generateSignedUrl('any-id', 3600)).rejects.toThrow(
+        'All readable Bs instances are closed',
+      );
     });
 
     it('should treat members without an isOpen flag as always open (e.g. BsMem)', async () => {
@@ -967,6 +967,135 @@ describe('BsMulti', () => {
         (b) => b.blobId === result1.blobId,
       );
       expect(matchingBlobs).toHaveLength(1);
+    });
+  });
+
+  describe('blocks', () => {
+    /** Bytes that do not repeat, the same for the same seed. */
+    const noise = (size: number, seed: number): Buffer => {
+      const bytes = Buffer.alloc(size);
+      let x = seed;
+      for (let i = 0; i < size; i++) {
+        x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+        bytes[i] = x >>> 24;
+      }
+      return bytes;
+    };
+
+    const readAll = async (stream: ReadableStream<Uint8Array>) => {
+      const parts: Uint8Array[] = [];
+      const reader = stream.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return Buffer.concat(parts);
+        parts.push(value);
+      }
+    };
+
+    it('fetches only the blocks the local store lacks, and keeps the blob', async () => {
+      const v1 = noise(10 * 1024 * 1024, 1);
+      const v2 = Buffer.from(v1);
+      v2[v1.length / 2] ^= 0xff;
+      await localCache.setBlob(v1);
+      const { blobId } = await remoteStore.setBlob(v2);
+      const blocks = await remoteStore.getBlobBlocks(blobId);
+      const fetched = vi.spyOn(remotePeer, 'getBlock');
+
+      const { content } = await bsMulti.getBlob(blobId);
+      expect(content.equals(v2)).toBe(true);
+      expect(fetched.mock.calls.length).toBeGreaterThan(0);
+      expect(fetched.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(fetched.mock.calls.length).toBeLessThan(blocks.length);
+
+      // Kept: the next read is local.
+      expect(await localCache.blobExists(blobId)).toBe(true);
+      fetched.mockClear();
+      await bsMulti.getBlob(blobId);
+      expect(fetched).not.toHaveBeenCalled();
+    });
+
+    it('keeps a streamed blob once the stream was read to its end', async () => {
+      const content = noise(3 * 1024 * 1024, 2);
+      const { blobId } = await remoteStore.setBlob(content);
+
+      const stream = await bsMulti.getBlobStream(blobId);
+      expect(await localCache.blobExists(blobId)).toBe(false);
+      expect((await readAll(stream)).equals(content)).toBe(true);
+      expect(await localCache.blobExists(blobId)).toBe(true);
+    });
+
+    it('does not keep a blob read only in part, but keeps its blocks', async () => {
+      const { blobId } = await remoteStore.setBlob('a partly read blob');
+      const [{ blockId }] = await remoteStore.getBlobBlocks(blobId);
+
+      const { content } = await bsMulti.getBlob(blobId, {
+        range: { start: 2, end: 6 },
+      });
+      expect(content.toString()).toBe('part');
+      expect(await localCache.blobExists(blobId)).toBe(false);
+      expect(await localCache.blockExists(blockId)).toBe(true);
+    });
+
+    it('reads anyway when the blob cannot be kept', async () => {
+      const { blobId } = await remoteStore.setBlob('cannot be kept');
+      localCache.setBlobBlocks = async () => {
+        throw new Error('disk full');
+      };
+      const { content } = await bsMulti.getBlob(blobId);
+      expect(content.toString()).toBe('cannot be kept');
+    });
+
+    it('reads anyway when a block cannot be kept', async () => {
+      const { blobId } = await remoteStore.setBlob('block not kept');
+      localCache.setBlock = async () => {
+        throw new Error('disk full');
+      };
+      const { content } = await bsMulti.getBlob(blobId);
+      expect(content.toString()).toBe('block not kept');
+    });
+
+    it('answers block questions through the stores', async () => {
+      const { blobId } = await remoteStore.setBlob('blocks');
+      const [{ blockId }] = await remoteStore.getBlobBlocks(blobId);
+      expect(await bsMulti.blockExists(blockId)).toBe(true);
+      expect(await bsMulti.blockExists('nonexistent123')).toBe(false);
+      await expect(bsMulti.getBlock('nonexistent123')).rejects.toThrow(
+        'Block not found: nonexistent123',
+      );
+      await expect(bsMulti.getBlobBlocks('nonexistent123')).rejects.toThrow(
+        'Blob not found: nonexistent123',
+      );
+    });
+
+    it('writes blocks and blobs to every writable', async () => {
+      const second = new BsMem();
+      const multi = new BsMulti([
+        { bs: localCache, priority: 0, read: true, write: true },
+        { bs: second, priority: 1, read: true, write: true },
+      ]);
+      await multi.init();
+
+      const block = await multi.setBlock(Buffer.from('a block'));
+      expect(await localCache.blockExists(block.blockId)).toBe(true);
+      expect(await second.blockExists(block.blockId)).toBe(true);
+
+      const blobId = (await new BsMem().setBlob('a block')).blobId;
+      const properties = await multi.setBlobBlocks(blobId, [block]);
+      expect(properties.blobId).toBe(blobId);
+      expect(await second.blobExists(blobId)).toBe(true);
+    });
+
+    it('refuses to write blocks without a writable', async () => {
+      const multi = new BsMulti([
+        { bs: remoteStore, priority: 0, read: true, write: false },
+      ]);
+      await multi.init();
+      await expect(multi.setBlock(Buffer.from('x'))).rejects.toThrow(
+        'No writable Bs available',
+      );
+      await expect(multi.setBlobBlocks('x', [])).rejects.toThrow(
+        'No writable Bs available',
+      );
     });
   });
 });

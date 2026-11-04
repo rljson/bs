@@ -5,7 +5,13 @@
 // found in the LICENSE file in the root of this package.
 
 import {
-  BLOB_CHUNK_BYTES,
+  readBlocks,
+  streamBlocks,
+  verifyBlock,
+  writeBlocks,
+} from './blob-blocks.ts';
+import {
+  BlobBlock,
   BlobProperties,
   Bs,
   DownloadBlobOptions,
@@ -23,34 +29,27 @@ export interface BsPeerOptions {
    * error. Defaults to 30_000. A non-positive value disables the timeout.
    */
   requestTimeoutMs?: number;
-
-  /**
-   * Bytes per pull in {@link BsPeer.getBlobStream}. Defaults to
-   * {@link BLOB_CHUNK_BYTES}.
-   *
-   * Worth lowering on a link where one 4 MB message is itself too much to hold,
-   * and worth lowering in a test so a fixture can cross several chunks without
-   * being megabytes wide.
-   */
-  chunkBytes?: number;
 }
 
 /**
  * Peer implementation of the Bs interface that communicates over a socket.
  * Allows remote access to a blob storage instance.
+ *
+ * Bytes cross the socket only as blocks, one block per message, so no message
+ * carries more than `BLOCK_MAX_BYTES` whatever the blob's size. Reading a blob
+ * asks for its block list first and then for its blocks; storing one sends
+ * only the blocks the other side does not hold yet.
  */
 export class BsPeer implements Bs {
   isOpen: boolean = false;
 
   private readonly _requestTimeoutMs: number;
-  private readonly _chunkBytes: number;
 
   constructor(
     private _socket: Socket,
     options?: BsPeerOptions,
   ) {
     this._requestTimeoutMs = options?.requestTimeoutMs ?? 30_000;
-    this._chunkBytes = options?.chunkBytes ?? BLOB_CHUNK_BYTES;
   }
 
   // ...........................................................................
@@ -149,170 +148,91 @@ export class BsPeer implements Bs {
 
   // ...........................................................................
   /**
-   * Stores a blob from Buffer, string, or ReadableStream and returns properties.
-   * @param content - The blob content to store
-   * @returns Promise resolving to blob properties
+   * Sends one request and waits for its acknowledgement.
+   * @param event - The request.
+   * @param args - Its arguments.
+   * @returns The result the other side acknowledged with.
    */
-  setBlob(
-    content: Buffer | string | ReadableStream<Uint8Array>,
-  ): Promise<BlobProperties> {
+  private _request<T>(event: string, ...args: unknown[]): Promise<T> {
     if (!this.isOpen) return this._closedError();
 
     return this._withTimeout(
-      new Promise((resolve, reject) => {
-        // Convert ReadableStream to Buffer if needed
-        if (content instanceof ReadableStream) {
-          // For streams, we need to read all chunks first
-          const reader = content.getReader();
-          const chunks: Uint8Array[] = [];
-
-          const readStream = async () => {
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-              }
-              const totalLength = chunks.reduce(
-                (sum, chunk) => sum + chunk.length,
-                0,
-              );
-              const buffer = Buffer.concat(
-                chunks.map((chunk) => Buffer.from(chunk)),
-                totalLength,
-              );
-
-              // Now emit with the buffer
-              this._socket.emit(
-                'setBlob',
-                buffer,
-                (error: Error | null, result?: BlobProperties) => {
-                  if (error) reject(error);
-                  else resolve(result!);
-                },
-              );
-            } catch (err) {
-              /* v8 ignore next -- @preserve */
-              reject(err);
-            }
-          };
-
-          readStream();
-        } else {
-          // For Buffer or string, emit directly
-          this._socket.emit(
-            'setBlob',
-            content,
-            (error: Error | null, result?: BlobProperties) => {
-              if (error) reject(error);
-              else resolve(result!);
-            },
-          );
-        }
+      new Promise<T>((resolve, reject) => {
+        this._socket.emit(event, ...args, (error: Error | null, result?: T) => {
+          if (error) reject(error);
+          else resolve(result as T);
+        });
       }),
-      'setBlob',
+      event,
     );
   }
 
   // ...........................................................................
   /**
-   * Retrieves a blob by its ID as a Buffer.
+   * Stores a blob from Buffer, string, or ReadableStream and returns
+   * properties. Cuts the content into blocks here and sends only the blocks
+   * the other side lacks, then the block list.
+   * @param content - The blob content to store
+   * @returns Promise resolving to blob properties
+   */
+  async setBlob(
+    content: Buffer | string | ReadableStream<Uint8Array>,
+  ): Promise<BlobProperties> {
+    if (!this.isOpen) return this._closedError();
+
+    const { blobId, blocks } = await writeBlocks(
+      content,
+      async ({ blockId }, bytes) => {
+        if (!(await this.blockExists(blockId))) await this.setBlock(bytes);
+      },
+    );
+    return this.setBlobBlocks(blobId, blocks);
+  }
+
+  // ...........................................................................
+  /**
+   * Retrieves a blob by its ID as a Buffer, assembled here from its blocks.
+   * A range fetches only the blocks it touches.
    * @param blobId - The unique identifier of the blob
    * @param options - Download options
    * @returns Promise resolving to blob content and properties
    */
-  getBlob(
+  async getBlob(
     blobId: string,
     options?: DownloadBlobOptions,
   ): Promise<{ content: Buffer; properties: BlobProperties }> {
     if (!this.isOpen) return this._closedError();
 
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit(
-          'getBlob',
-          blobId,
-          options,
-          (
-            error: Error | null,
-            result?: { content: Buffer; properties: BlobProperties },
-          ) => {
-            if (error) reject(error);
-            else resolve(result!);
-          },
-        );
-      }),
-      'getBlob',
+    const properties = await this.getBlobProperties(blobId);
+    const blocks = await this.getBlobBlocks(blobId);
+    const content = await readBlocks(
+      blocks,
+      (blockId) => this.getBlock(blockId),
+      options?.range,
     );
+    return { content, properties };
   }
 
   // ...........................................................................
   /**
-   * Retrieves a blob by its ID as a ReadableStream, pulled in chunks.
+   * Retrieves a blob by its ID as a ReadableStream, pulled one block at a
+   * time.
    *
-   * ## Why this is not one request
-   *
-   * It used to be: `emit('getBlobStream', blobId, cb)`, expecting a
-   * `ReadableStream` back in the acknowledgement. **That could never work.** An
-   * ack crosses the wire as data, and a stream is a live object with a reader,
-   * a queue and a lock — none of which survives serialisation. On socket.io it
-   * arrives as `{}`. The method was on the interface, had an implementation on
-   * every class, was covered by tests against a mock that handed the object
-   * straight back, and was broken for every real socket in the system. Nothing
-   * called it, which is the only reason it never showed.
-   *
-   * So the stream is built on this side instead, out of ranged
-   * {@link getBlob} calls — `DownloadBlobOptions.range` was already on the
-   * interface, and {@link BsFs} was already honouring it with a positioned read
-   * off disk. Nobody was asking.
-   *
-   * ## What it changes
-   *
-   * A whole-blob read costs the server the entire file in a Buffer plus the
-   * parser's copy of it, and costs the consumer the same again — for one file,
-   * at one moment, per reader. A pull costs both sides one
-   * {@link BLOB_CHUNK_BYTES} chunk.
-   *
-   * Pull-based, deliberately: the consumer's own pace is the flow control, so
-   * no window, no credit protocol and no stream bookkeeping on the server. Each
-   * pull is an ordinary request that passes the hub's serving gate on its own,
-   * which is what makes that gate bound chunk-sized work instead of
-   * blob-sized.
+   * A stream cannot cross a socket in an acknowledgement — it arrives as `{}`
+   * — so it is built on this side. The consumer's pace is the flow control:
+   * the next block is asked for when the consumer reads on. The stream fails
+   * at its end unless the bytes hash to `blobId`.
    * @param blobId - The unique identifier of the blob
    * @returns Promise resolving to readable stream
    */
   async getBlobStream(blobId: string): Promise<ReadableStream<Uint8Array>> {
     if (!this.isOpen) return this._closedError();
 
-    // The blob's size decides how many pulls this takes, and asking for it
-    // first also fails fast on a missing blob — before the caller is handed a
-    // stream that can only fail on its first read.
-    const { size } = await this.getBlobProperties(blobId);
-
-    let offset = 0;
-    return new ReadableStream<Uint8Array>({
-      pull: async (controller) => {
-        if (offset >= size) {
-          controller.close();
-          return;
-        }
-        const end = Math.min(offset + this._chunkBytes, size);
-        const { content } = await this.getBlob(blobId, {
-          range: { start: offset, end },
-        });
-        // A server that answers a range with nothing would otherwise spin this
-        // pull forever, one empty chunk at a time, and look like a hang rather
-        // than a fault.
-        if (content.length === 0) {
-          throw new Error(
-            `Blob '${blobId}' returned no bytes for range ` +
-              `${String(offset)}-${String(end)} of ${String(size)}`,
-          );
-        }
-        offset += content.length;
-        controller.enqueue(new Uint8Array(content));
-      },
-    });
+    // Asking for the block list first also fails fast on a missing blob —
+    // before the caller is handed a stream that can only fail on its first
+    // read.
+    const blocks = await this.getBlobBlocks(blobId);
+    return streamBlocks(blobId, blocks, (blockId) => this.getBlock(blockId));
   }
 
   // ...........................................................................
@@ -322,17 +242,7 @@ export class BsPeer implements Bs {
    * @returns Promise that resolves when deletion is complete
    */
   deleteBlob(blobId: string): Promise<void> {
-    if (!this.isOpen) return this._closedError();
-
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit('deleteBlob', blobId, (error: Error | null) => {
-          if (error) reject(error);
-          else resolve();
-        });
-      }),
-      'deleteBlob',
-    );
+    return this._request('deleteBlob', blobId);
   }
 
   // ...........................................................................
@@ -342,21 +252,7 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to true if blob exists
    */
   blobExists(blobId: string): Promise<boolean> {
-    if (!this.isOpen) return this._closedError();
-
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit(
-          'blobExists',
-          blobId,
-          (error: Error | null, exists?: boolean) => {
-            if (error) reject(error);
-            else resolve(exists!);
-          },
-        );
-      }),
-      'blobExists',
-    );
+    return this._request('blobExists', blobId);
   }
 
   // ...........................................................................
@@ -366,21 +262,7 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to blob properties
    */
   getBlobProperties(blobId: string): Promise<BlobProperties> {
-    if (!this.isOpen) return this._closedError();
-
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit(
-          'getBlobProperties',
-          blobId,
-          (error: Error | null, result?: BlobProperties) => {
-            if (error) reject(error);
-            else resolve(result!);
-          },
-        );
-      }),
-      'getBlobProperties',
-    );
+    return this._request('getBlobProperties', blobId);
   }
 
   // ...........................................................................
@@ -390,21 +272,7 @@ export class BsPeer implements Bs {
    * @returns Promise resolving to list of blobs
    */
   listBlobs(options?: ListBlobsOptions): Promise<ListBlobsResult> {
-    if (!this.isOpen) return this._closedError();
-
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit(
-          'listBlobs',
-          options || {},
-          (error: Error | null, result?: ListBlobsResult) => {
-            if (error) reject(error);
-            else resolve(result!);
-          },
-        );
-      }),
-      'listBlobs',
-    );
+    return this._request('listBlobs', options || {});
   }
 
   // ...........................................................................
@@ -420,22 +288,60 @@ export class BsPeer implements Bs {
     expiresIn: number,
     permissions?: 'read' | 'delete',
   ): Promise<string> {
-    if (!this.isOpen) return this._closedError();
+    return this._request('generateSignedUrl', blobId, expiresIn, permissions);
+  }
 
-    return this._withTimeout(
-      new Promise((resolve, reject) => {
-        this._socket.emit(
-          'generateSignedUrl',
-          blobId,
-          expiresIn,
-          permissions,
-          (error: Error | null, url?: string) => {
-            if (error) reject(error);
-            else resolve(url!);
-          },
-        );
-      }),
-      'generateSignedUrl',
-    );
+  // ...........................................................................
+  /**
+   * Gets the blocks a blob is made of.
+   * @param blobId - The unique identifier of the blob
+   * @returns Promise resolving to the blocks, in order
+   */
+  getBlobBlocks(blobId: string): Promise<BlobBlock[]> {
+    return this._request('getBlobBlocks', blobId);
+  }
+
+  // ...........................................................................
+  /**
+   * Gets one block, and fails unless its bytes hash to `blockId`.
+   * @param blockId - The unique identifier of the block
+   * @returns Promise resolving to the block's bytes
+   */
+  async getBlock(blockId: string): Promise<Buffer> {
+    const arrived = await this._request<Uint8Array>('getBlock', blockId);
+    const bytes = Buffer.isBuffer(arrived) ? arrived : Buffer.from(arrived);
+    verifyBlock(blockId, bytes);
+    return bytes;
+  }
+
+  // ...........................................................................
+  /**
+   * Checks if a block exists.
+   * @param blockId - The unique identifier of the block
+   * @returns Promise resolving to true if the block exists
+   */
+  blockExists(blockId: string): Promise<boolean> {
+    return this._request('blockExists', blockId);
+  }
+
+  // ...........................................................................
+  /**
+   * Stores one block.
+   * @param content - The block's bytes
+   * @returns Promise resolving to the stored block
+   */
+  setBlock(content: Buffer): Promise<BlobBlock> {
+    return this._request('setBlock', content);
+  }
+
+  // ...........................................................................
+  /**
+   * Stores a blob made of blocks the other side holds.
+   * @param blobId - The unique identifier of the blob
+   * @param blocks - Its blocks, in order
+   * @returns Promise resolving to blob properties
+   */
+  setBlobBlocks(blobId: string, blocks: BlobBlock[]): Promise<BlobProperties> {
+    return this._request('setBlobBlocks', blobId, blocks);
   }
 }

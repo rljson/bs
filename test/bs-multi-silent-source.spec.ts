@@ -24,7 +24,7 @@
 // is nobody else to ask.
 // .............................................................................
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   BLOB_SOURCE_TIMEOUT_MS,
@@ -32,6 +32,7 @@ import {
   BsMem,
   BsMulti,
   BsMultiBs,
+  SLOW_SOURCE_MEMORY_MS,
 } from '../src';
 
 /** A store that is OPEN and never answers a read. */
@@ -41,6 +42,9 @@ const silentStore = (inner: Bs): Bs =>
       if (
         prop === 'getBlob' ||
         prop === 'getBlobStream' ||
+        prop === 'getBlobBlocks' ||
+        prop === 'getBlock' ||
+        prop === 'blockExists' ||
         prop === 'blobExists' ||
         prop === 'getBlobProperties'
       ) {
@@ -84,9 +88,9 @@ describe('BsMulti — a source that never answers', () => {
     const { bsMulti, blobId } = await build();
     const result = await raced(bsMulti.getBlob(blobId));
     expect(result, 'getBlob waited out a silent source').not.toBe('late');
-    expect(
-      (result as { content: Buffer }).content.toString('utf8'),
-    ).toBe('the bytes');
+    expect((result as { content: Buffer }).content.toString('utf8')).toBe(
+      'the bytes',
+    );
   }, 20_000);
 
   // ...........................................................................
@@ -115,38 +119,73 @@ describe('BsMulti — a source that never answers', () => {
   it('getBlobProperties answers from the next source', async () => {
     const { bsMulti, blobId } = await build();
     const result = await raced(bsMulti.getBlobProperties(blobId));
-    expect(
-      result,
-      'getBlobProperties waited out a silent source',
-    ).not.toBe('late');
+    expect(result, 'getBlobProperties waited out a silent source').not.toBe(
+      'late',
+    );
   }, 20_000);
 
   // ...........................................................................
-  // A source that is abandoned and then answers ANYWAY.
-  //
-  // The bound rejects, the cascade moves on, and the slow answer still turns
-  // up afterwards. It has to be discarded — and if it is a stream, CANCELLED,
-  // because an abandoned `ReadableStream` leaves its source pushing bytes
-  // nobody will ever read.
-  // ...........................................................................
-  it('cancels a stream that an abandoned source delivers late', async () => {
-    let cancelled = false;
+  it('reads each block from the next source when one knows the blob but not its blocks', async () => {
+    // Blocks are asked for one by one, each through the whole cascade. A
+    // source that answered the block list and then goes silent costs every
+    // block the bound, not the read its whole request timeout.
     const holder = new BsMem();
     const { blobId } = await holder.setBlob('the bytes');
-
-    const lateInner = new BsMem();
-    const late = new Proxy(lateInner, {
+    const listInner = new BsMem();
+    await listInner.setBlob('the bytes');
+    const listOnly = new Proxy(listInner, {
       get(target, prop, receiver) {
-        if (prop === 'getBlobStream') {
-          return async () => {
-            await new Promise((r) =>
-              setTimeout(r, BLOB_SOURCE_TIMEOUT_MS + 300),
-            );
-            return {
-              cancel: () => {
-                cancelled = true;
-              },
-            };
+        if (prop === 'getBlock') return () => new Promise(() => {});
+        return Reflect.get(target, prop, receiver);
+      },
+    }) as Bs;
+
+    const bsMulti = new BsMulti([
+      { bs: listOnly, priority: 0, read: true, write: false },
+      { bs: holder, priority: 1, read: true, write: false },
+    ]);
+    await bsMulti.init();
+
+    const result = await raced(bsMulti.getBlob(blobId));
+    expect(result, 'a block read waited out a silent source').not.toBe('late');
+    expect((result as { content: Buffer }).content.toString('utf8')).toBe(
+      'the bytes',
+    );
+  }, 20_000);
+
+  // ...........................................................................
+  it('costs one bound for a blob of many blocks, not one per block', async () => {
+    const bytes = Buffer.alloc(8 * 1024 * 1024);
+    for (let i = 0; i < bytes.length; i += 4) {
+      bytes.writeUInt32LE(Math.imul(i, 2654435761) >>> 0, i);
+    }
+    const holder = new BsMem();
+    const { blobId } = await holder.setBlob(bytes);
+    expect((await holder.getBlobBlocks(blobId)).length).toBeGreaterThan(3);
+
+    const bsMulti = new BsMulti([
+      { bs: silentStore(new BsMem()), priority: 0, read: true, write: false },
+      { bs: holder, priority: 1, read: true, write: false },
+    ]);
+    await bsMulti.init();
+
+    const result = await raced(bsMulti.getBlob(blobId));
+    expect(result, 'every block waited out the silent source').not.toBe('late');
+    expect((result as { content: Buffer }).content.equals(bytes)).toBe(true);
+  }, 20_000);
+
+  // ...........................................................................
+  it('asks a slow source first again once the memory has passed', async () => {
+    const holder = new BsMem();
+    const { blobId } = await holder.setBlob('the bytes');
+    let asked = 0;
+    const slowInner = new BsMem();
+    const slow = new Proxy(slowInner, {
+      get(target, prop, receiver) {
+        if (prop === 'blobExists') {
+          return () => {
+            asked++;
+            return new Promise(() => {});
           };
         }
         return Reflect.get(target, prop, receiver);
@@ -154,25 +193,37 @@ describe('BsMulti — a source that never answers', () => {
     }) as Bs;
 
     const bsMulti = new BsMulti([
-      { bs: late, priority: 0, read: true, write: false },
+      { bs: slow, priority: 0, read: true, write: false },
       { bs: holder, priority: 1, read: true, write: false },
     ]);
     await bsMulti.init();
 
-    const stream = await bsMulti.getBlobStream(blobId);
-    expect(stream, 'the holder did not answer').toBeDefined();
+    // Set aside once: asked, then the holder answers.
+    expect(await bsMulti.blobExists(blobId)).toBe(true);
+    expect(asked).toBe(1);
 
-    // Give the abandoned source time to deliver, then assert it was tidied up.
-    await new Promise((r) => setTimeout(r, 800));
-    expect(cancelled, 'the late stream was abandoned without cancelling').toBe(
-      true,
-    );
+    // Within the memory the holder is asked first and answers.
+    expect(await bsMulti.blobExists(blobId)).toBe(true);
+    expect(asked).toBe(1);
+
+    // Afterwards the slow source gets its turn first again.
+    const now = Date.now();
+    const clock = vi
+      .spyOn(Date, 'now')
+      .mockReturnValue(now + SLOW_SOURCE_MEMORY_MS + 1);
+    try {
+      expect(await bsMulti.blobExists(blobId)).toBe(true);
+      expect(asked).toBe(2);
+    } finally {
+      clock.mockRestore();
+    }
   }, 20_000);
 
   // ...........................................................................
-  it('discards a late answer that is not a stream, without complaint', async () => {
-    // `getBlob` resolves to `{ content, properties }` — nothing to cancel, so
-    // the cleanup must simply let it go.
+  it('discards a late answer, without complaint', async () => {
+    // A source that is abandoned and then answers ANYWAY: the bound
+    // rejected, the cascade moved on, and the slow answer still turns up
+    // afterwards. Nobody waits for it any more, so it is simply let go.
     const holder = new BsMem();
     const { blobId } = await holder.setBlob('the bytes');
 
@@ -180,12 +231,12 @@ describe('BsMulti — a source that never answers', () => {
     await lateInner.setBlob('the bytes');
     const late = new Proxy(lateInner, {
       get(target, prop, receiver) {
-        if (prop === 'getBlob') {
+        if (prop === 'getBlock') {
           return async (id: string) => {
             await new Promise((r) =>
               setTimeout(r, BLOB_SOURCE_TIMEOUT_MS + 300),
             );
-            return (target as Bs).getBlob(id);
+            return (target as Bs).getBlock(id);
           };
         }
         return Reflect.get(target, prop, receiver);
@@ -215,9 +266,10 @@ describe('BsMulti — a source that never answers', () => {
     const { blobId } = await holder.setBlob('the bytes');
 
     const lateInner = new BsMem();
+    await lateInner.setBlob('the bytes');
     const late = new Proxy(lateInner, {
       get(target, prop, receiver) {
-        if (prop === 'getBlob') {
+        if (prop === 'getBlock') {
           return async () => {
             await new Promise((r) =>
               setTimeout(r, BLOB_SOURCE_TIMEOUT_MS + 300),
@@ -248,11 +300,11 @@ describe('BsMulti — a source that never answers', () => {
     // answers after the bound would have fired, and the read still succeeds.
     const slow = new BsMem();
     const { blobId } = await slow.setBlob('from the only source');
-    const realGet = slow.getBlob.bind(slow);
-    slow.getBlob = (async (id: string) => {
+    const realGet = slow.getBlock.bind(slow);
+    slow.getBlock = (async (id: string) => {
       await new Promise((r) => setTimeout(r, BLOB_SOURCE_TIMEOUT_MS + 500));
       return realGet(id);
-    }) as typeof slow.getBlob;
+    }) as typeof slow.getBlock;
 
     const bsMulti = new BsMulti([
       { bs: slow, priority: 0, read: true, write: false },
@@ -263,8 +315,8 @@ describe('BsMulti — a source that never answers', () => {
     expect(result, 'the only source was bounded and abandoned').not.toBe(
       'late',
     );
-    expect(
-      (result as { content: Buffer }).content.toString('utf8'),
-    ).toBe('from the only source');
+    expect((result as { content: Buffer }).content.toString('utf8')).toBe(
+      'from the only source',
+    );
   }, 20_000);
 });
