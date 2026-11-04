@@ -2,6 +2,48 @@
 
 ## [Unreleased]
 
+### Blobs are stored and moved as blocks — breaking
+
+- **Every blob is cut into blocks** at boundaries the content decides
+  (FastCDC with normalized chunking: 256 KB minimum, 1 MB average, 4 MB
+  maximum). A block is identified by the SHA256 of its bytes and stored once,
+  however many blobs contain it. A blob keeps its id: the SHA256 of its whole
+  content.
+- **Two versions of a file share their unchanged blocks.** A change moves only
+  the boundaries next to it, whether bytes were overwritten, inserted or
+  removed: on 24 MB, each of these left at most three new blocks.
+- **`Bs` has five new calls:** `getBlobBlocks`, `getBlock`, `blockExists`,
+  `setBlock`, `setBlobBlocks`. `getBlob`, ranges and `getBlobStream` are built
+  on them (`readBlocks`, `streamBlocks`).
+- **Over a socket only blocks travel, one per message.** `BsServer` and
+  `BsPeerBridge` no longer answer `getBlob` or `setBlob`: a whole blob in one
+  message was bounded by nothing but its file, and a socket closes the
+  connection on a message above its cap. A blob of any size now crosses a
+  socket whose cap is above 4 MB. `BsPeer` reads only the blocks a range
+  touches, and `BsPeer.setBlob` sends only the blocks the other side lacks.
+- **Nothing is trusted on arrival.** `BsPeer.getBlock` checks every block
+  against its id, every stream checks the whole blob at its end, and
+  `setBlobBlocks` refuses blocks that do not make the blob.
+- **`BsMulti` reads block by block,** each block from the first source that
+  holds it, keeps every block it read elsewhere, and stores a blob read whole
+  in its writables. A ranged read no longer lands in the cache as a blob of
+  its own.
+- **A slow source costs one bound per read, not one per block.** A source set
+  aside after `BLOB_SOURCE_TIMEOUT_MS` is asked after all others for
+  `SLOW_SOURCE_MEMORY_MS` (30 s). It is still asked when nobody else answers.
+- **Removed:** `BLOB_CHUNK_BYTES` and `BsPeerOptions.chunkBytes`. **New:**
+  `BLOCK_MIN_BYTES`, `BLOCK_AVG_BYTES`, `BLOCK_MAX_BYTES`, `ContentId`,
+  `blockEnd`, `forEachBlock`, `writeBlocks`, `readBlocks`, `streamBlocks`,
+  `verifyBlock`, `verifyBlob`, `BlobBlock`, `BlobLayout`,
+  `SLOW_SOURCE_MEMORY_MS`.
+- **Both ends of a socket need this version.** An older peer neither asks for
+  nor answers blocks.
+- **A stream asks for up to four blocks ahead** (`BLOCK_READ_AHEAD`), in
+  order, holding at most four blocks. One at a time cost a round trip per
+  block: with 10 ms per round trip, 60 MB took 625 ms one at a time and
+  164 ms four ahead. A block that fails fails the stream where the reader
+  reaches it; a cancelled stream asks for nothing more.
+
 ### CLAUDE.md keeps this repo's own rules
 
 - The rules every rljson repo shares (coverage, pinning, docs, releases,

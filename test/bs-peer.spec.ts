@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { BsMem, BsPeer, PeerSocketMock } from '../src';
+import { BLOCK_MAX_BYTES, BsMem, BsPeer, PeerSocketMock } from '../src';
 
 describe('BsPeer', () => {
   let bsMem: BsMem;
@@ -136,7 +136,7 @@ describe('BsPeer', () => {
       const errorSocket = new PeerSocketMock(bsMem);
       const originalEmit = errorSocket.emit.bind(errorSocket);
       errorSocket.emit = (eventName: string | symbol, ...args: unknown[]) => {
-        if (eventName === 'setBlob') {
+        if (eventName === 'setBlobBlocks') {
           const cb = args[args.length - 1] as (error: Error | null) => void;
           cb(new Error('Storage failed'));
           return true;
@@ -156,7 +156,7 @@ describe('BsPeer', () => {
       const errorSocket = new PeerSocketMock(bsMem);
       const originalEmit = errorSocket.emit.bind(errorSocket);
       errorSocket.emit = (eventName: string | symbol, ...args: unknown[]) => {
-        if (eventName === 'setBlob') {
+        if (eventName === 'setBlock') {
           const cb = args[args.length - 1] as (error: Error | null) => void;
           cb(new Error('Storage failed'));
           return true;
@@ -221,58 +221,176 @@ describe('BsPeer', () => {
       );
     });
 
-    it('pulls a blob larger than one chunk in chunk-sized ranges', async () => {
-      // The whole point of the rewrite: a blob crosses as bytes, a bounded
-      // number of them at a time. What must be true is that no single request
-      // ever asks for the whole thing — that request is the one that put a
-      // gigabyte of ArrayBuffers on the cloud hub's heap.
-      // The production chunk is 4 MB; a fixture that size would make the test
-      // about allocation speed rather than about chunking.
-      const chunk = 64;
-      const small = new BsPeer(socket, { chunkBytes: chunk });
-      await small.init();
-      const content = Buffer.alloc(chunk * 3 + 7, 'a');
-      const { blobId } = await small.setBlob(content);
-
-      const asked: Array<{ start: number; end?: number }> = [];
-      const realGetBlob = small.getBlob.bind(small);
-      small.getBlob = (id, options) => {
-        if (options?.range) asked.push(options.range);
-        return realGetBlob(id, options);
-      };
-
-      const stream = await small.getBlobStream(blobId);
-      const reader = stream.getReader();
-      const chunks: Uint8Array[] = [];
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-      }
-
-      expect(Buffer.concat(chunks).equals(content)).toBe(true);
-      expect(asked).toHaveLength(4);
-      expect(asked[0]).toEqual({ start: 0, end: chunk });
-      expect(asked[3]).toEqual({ start: chunk * 3, end: content.length });
-      for (const range of asked) {
-        expect((range.end ?? content.length) - range.start).toBeLessThanOrEqual(
-          chunk,
-        );
-      }
-    });
-
-    it('fails instead of spinning when a range comes back empty', async () => {
-      // A server that answers a range with nothing would otherwise drive this
-      // pull forever, one empty chunk at a time, and present as a hang — the
-      // hardest kind of fault to attribute. It says what happened instead.
-      const { blobId } = await bsPeer.setBlob(Buffer.alloc(32, 'b'));
-      bsPeer.getBlob = async () => ({
-        content: Buffer.alloc(0),
-        properties: { blobId, size: 32, createdAt: new Date() },
-      });
+    it('fails when the blocks do not make the blob', async () => {
+      const { blobId } = await bsPeer.setBlob('the blob');
+      const other = await bsPeer.setBlob('another blob');
+      bsPeer.getBlobBlocks = () => bsMem.getBlobBlocks(other.blobId);
 
       const stream = await bsPeer.getBlobStream(blobId);
-      await expect(stream.getReader().read()).rejects.toThrow('no bytes');
+      const reader = stream.getReader();
+      await reader.read();
+      await expect(reader.read()).rejects.toThrow(
+        `Blocks of blob '${blobId}' make '${other.blobId}'`,
+      );
+    });
+  });
+
+  describe('blocks on the wire', () => {
+    /** Records every request and the largest buffer it carried. */
+    const record = (target: PeerSocketMock) => {
+      const sent: Array<{ event: string; bytes: number }> = [];
+      const originalEmit = target.emit.bind(target);
+      target.emit = (eventName: string | symbol, ...args: unknown[]) => {
+        const bytes = Math.max(
+          0,
+          ...args.map((arg) => (Buffer.isBuffer(arg) ? arg.length : 0)),
+        );
+        sent.push({ event: String(eventName), bytes });
+        const cb = args[args.length - 1] as (
+          error: Error | null,
+          result?: unknown,
+        ) => void;
+        return originalEmit(
+          eventName,
+          ...args.slice(0, -1),
+          (error: Error | null, result?: unknown) => {
+            if (Buffer.isBuffer(result)) {
+              sent[sent.length - 1].bytes = Math.max(
+                sent[sent.length - 1].bytes,
+                result.length,
+              );
+            }
+            cb(error, result);
+          },
+        );
+      };
+      return sent;
+    };
+
+    const large = (size: number, seed: number): Buffer => {
+      const bytes = Buffer.alloc(size);
+      let x = seed;
+      for (let i = 0; i < size; i++) {
+        x = (Math.imul(x, 1103515245) + 12345) >>> 0;
+        bytes[i] = x >>> 24;
+      }
+      return bytes;
+    };
+
+    it('sends a large blob as blocks, and only the blocks the other side lacks', async () => {
+      const sent = record(socket);
+      const content = large(10 * 1024 * 1024, 1);
+      const { blobId } = await bsPeer.setBlob(content);
+
+      const blocks = await bsMem.getBlobBlocks(blobId);
+      expect(blocks.length).toBeGreaterThan(2);
+      expect(sent.filter((r) => r.event === 'setBlock')).toHaveLength(
+        blocks.length,
+      );
+      for (const r of sent)
+        expect(r.bytes).toBeLessThanOrEqual(BLOCK_MAX_BYTES);
+
+      // The same content again: every block is there, none crosses.
+      sent.length = 0;
+      await bsPeer.setBlob(content);
+      expect(sent.filter((r) => r.event === 'setBlock')).toHaveLength(0);
+
+      // A copy with one byte changed in the middle: the block around it
+      // crosses, the others do not.
+      sent.length = 0;
+      const changed = Buffer.from(content);
+      changed[content.length / 2] ^= 0xff;
+      await bsPeer.setBlob(changed);
+      expect(
+        sent.filter((r) => r.event === 'setBlock').length,
+      ).toBeLessThanOrEqual(2);
+    });
+
+    it('reads a large blob one block per message', async () => {
+      const content = large(10 * 1024 * 1024, 2);
+      const { blobId } = await bsMem.setBlob(content);
+      const blocks = await bsMem.getBlobBlocks(blobId);
+      const sent = record(socket);
+
+      const { content: read } = await bsPeer.getBlob(blobId);
+      expect(read.equals(content)).toBe(true);
+      expect(sent.filter((r) => r.event === 'getBlock')).toHaveLength(
+        blocks.length,
+      );
+      for (const r of sent)
+        expect(r.bytes).toBeLessThanOrEqual(BLOCK_MAX_BYTES);
+    });
+
+    it('reads a range from the blocks it touches only', async () => {
+      const content = large(10 * 1024 * 1024, 3);
+      const { blobId } = await bsMem.setBlob(content);
+      const sent = record(socket);
+
+      const { content: read } = await bsPeer.getBlob(blobId, {
+        range: { start: 100, end: 200 },
+      });
+      expect(read.equals(content.subarray(100, 200))).toBe(true);
+      expect(sent.filter((r) => r.event === 'getBlock')).toHaveLength(1);
+    });
+
+    it('fails when a block arrives with other bytes', async () => {
+      const { blobId } = await bsMem.setBlob('the blob');
+      const [{ blockId }] = await bsMem.getBlobBlocks(blobId);
+      const originalEmit = socket.emit.bind(socket);
+      socket.emit = (eventName: string | symbol, ...args: unknown[]) => {
+        if (eventName === 'getBlock') {
+          const cb = args[args.length - 1] as (
+            error: Error | null,
+            result?: unknown,
+          ) => void;
+          cb(null, new Uint8Array(Buffer.from('other bytes')));
+          return true;
+        }
+        return originalEmit(eventName, ...args);
+      };
+
+      await expect(bsPeer.getBlock(blockId)).rejects.toThrow(
+        `Block '${blockId}' arrived as`,
+      );
+      await expect(bsPeer.getBlob(blobId)).rejects.toThrow('arrived as');
+    });
+
+    it('accepts a block that arrives as a Uint8Array', async () => {
+      const { blobId } = await bsMem.setBlob('the blob');
+      const [{ blockId }] = await bsMem.getBlobBlocks(blobId);
+      const originalEmit = socket.emit.bind(socket);
+      socket.emit = (eventName: string | symbol, ...args: unknown[]) => {
+        if (eventName === 'getBlock') {
+          const cb = args[args.length - 1] as (
+            error: Error | null,
+            result?: unknown,
+          ) => void;
+          cb(null, new Uint8Array(Buffer.from('the blob')));
+          return true;
+        }
+        return originalEmit(eventName, ...args);
+      };
+
+      expect((await bsPeer.getBlock(blockId)).toString()).toBe('the blob');
+    });
+
+    it('answers block questions', async () => {
+      const block = await bsPeer.setBlock(Buffer.from('a block'));
+      expect(await bsPeer.blockExists(block.blockId)).toBe(true);
+      expect(await bsPeer.blockExists('nonexistent123')).toBe(false);
+      expect((await bsPeer.getBlock(block.blockId)).toString()).toBe('a block');
+      await expect(bsPeer.getBlock('nonexistent123')).rejects.toThrow(
+        'Block not found',
+      );
+    });
+
+    it('fails every request fast once the socket is closed', async () => {
+      await bsPeer.close();
+      bsPeer.isOpen = false;
+      await expect(bsPeer.setBlob('x')).rejects.toThrow('socket closed');
+      await expect(bsPeer.getBlob('x')).rejects.toThrow('socket closed');
+      await expect(bsPeer.getBlobStream('x')).rejects.toThrow('socket closed');
+      await expect(bsPeer.getBlock('x')).rejects.toThrow('socket closed');
     });
   });
 

@@ -9,6 +9,13 @@
  * Blobs are identified by SHA256 hash of their content.
  * Uses a flat storage pool - all blobs are stored globally by their content hash.
  * Metadata and organizational grouping is managed externally.
+ *
+ * Every blob is stored as a list of blocks, cut at boundaries the content
+ * decides (see `blob-blocks.ts`). A block is identified by the hash of its own
+ * bytes and stored once, however many blobs contain it. Between stores only
+ * blocks travel: a reader asks for a blob's block list and fetches the blocks
+ * it lacks, so two versions of a file that share most of their bytes share
+ * most of their blocks.
  */
 
 /**
@@ -35,22 +42,14 @@ export interface DownloadBlobOptions {
 }
 
 /**
- * How many bytes one pull of a remote blob stream asks for.
- *
- * **The number that decides how much a hub holds while it serves.** Before
- * ranged pulls, one blob read was one socket message: the server read the whole
- * file into a Buffer, the parser made a second copy of it, and both lived until
- * the consumer had it. On the cloud EventHub that was 487 MB of ArrayBuffers
- * that never fell while the heap climbed to 926 MB, and the process died of
- * `Ineffective mark-compacts` — full collections reclaiming 1.5 MB of 1020 MB,
- * because none of it was garbage. It was all work in flight.
- *
- * 4 MB, chosen from both ends: far under the 50 MB socket message cap that a
- * whole-blob read silently exceeds (a file past that limit cannot cross a
- * socket at all today, whatever the memory), and large enough that a 1 GB blob
- * is 256 round trips rather than 256 000.
+ * One block of a blob.
  */
-export const BLOB_CHUNK_BYTES = 4 * 1024 * 1024;
+export interface BlobBlock {
+  /** SHA256 hash of the block's bytes (unique identifier) */
+  blockId: string;
+  /** Size in bytes */
+  size: number;
+}
 
 /**
  * Options for listing blobs
@@ -145,4 +144,42 @@ export interface Bs {
     expiresIn: number,
     permissions?: 'read' | 'delete',
   ): Promise<string>;
+
+  /**
+   * Get the blocks a blob is made of, in order
+   * @param blobId - SHA256 hash of the blob
+   * @returns The blocks; their sizes add up to the blob's size
+   */
+  getBlobBlocks(blobId: string): Promise<BlobBlock[]>;
+
+  /**
+   * Get the bytes of one block
+   * @param blockId - SHA256 hash of the block
+   * @returns The block's bytes
+   */
+  getBlock(blockId: string): Promise<Buffer>;
+
+  /**
+   * Check if a block exists
+   * @param blockId - SHA256 hash of the block
+   * @returns True if exists
+   */
+  blockExists(blockId: string): Promise<boolean>;
+
+  /**
+   * Store one block. The block ID is calculated from its bytes.
+   * @param content - The block's bytes, at most `BLOCK_MAX_BYTES`
+   * @returns The stored block
+   */
+  setBlock(content: Buffer): Promise<BlobBlock>;
+
+  /**
+   * Store a blob made of blocks this storage already holds.
+   * Fails when a block is missing or when the blocks together do not hash to
+   * `blobId`, so a blob is only ever stored under the hash of its content.
+   * @param blobId - SHA256 hash of the whole blob
+   * @param blocks - The blob's blocks, in order
+   * @returns Properties of the stored blob
+   */
+  setBlobBlocks(blobId: string, blocks: BlobBlock[]): Promise<BlobProperties>;
 }

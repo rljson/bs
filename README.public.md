@@ -146,6 +146,43 @@ console.log(result1.blobId !== result3.blobId); // true
 - **Location Independence**: Blobs can be identified and verified anywhere
 - **Cache Efficiency**: Content can be cached anywhere and verified by its hash
 
+### Blocks
+
+Every blob is stored as **blocks**, cut where the content decides (FastCDC:
+256 KB minimum, 1 MB average, 4 MB maximum). A block is identified by the
+SHA256 of its bytes and stored once, however many blobs contain it, so two
+versions of a file share every block a change did not touch:
+
+```typescript
+const bs = new BsMem();
+
+const v1 = await bs.setBlob(bigFile);
+const v2 = await bs.setBlob(bigFileWithOneLineChanged);
+
+const blocks1 = new Set((await bs.getBlobBlocks(v1.blobId)).map((b) => b.blockId));
+const fresh = (await bs.getBlobBlocks(v2.blobId)).filter(
+  (b) => !blocks1.has(b.blockId),
+);
+// fresh: the one or two blocks around the change
+```
+
+Between stores only blocks travel, one per message: `BsPeer` asks for a
+blob's block list and then for the blocks it lacks, and `setBlob` sends only
+the blocks the other side lacks. A blob of any size therefore crosses a
+socket whose message cap is above 4 MB. Every block is checked against its
+id on arrival, and a streamed blob against its own id at its end.
+
+| Call | |
+| --- | --- |
+| `getBlobBlocks(blobId)` | the blob's blocks, in order |
+| `getBlock(blockId)` | one block's bytes |
+| `blockExists(blockId)` | whether a block is stored |
+| `setBlock(content)` | store one block |
+| `setBlobBlocks(blobId, blocks)` | store a blob from stored blocks; refused unless they hash to `blobId` |
+
+`deleteBlob` deletes a blob's block list; its blocks stay, since other blobs
+may contain them.
+
 ### Blob Properties
 
 All blobs have associated metadata:
@@ -566,9 +603,10 @@ describe('My Tests', () => {
 ### Network Efficiency
 
 - Use `BsPeer` for remote access with minimal protocol overhead
-- `BsMulti` automatically caches frequently accessed blobs locally
+- Only blocks cross a socket, one per message, and only the blocks the other
+  side lacks: a small change to a large file costs the blocks around it
+- `BsMulti` keeps every block it read elsewhere, so a block is fetched once
 - Content-addressable nature prevents redundant transfers (same content = same hash)
-- Hot-swapping in `BsMulti` reduces repeated network requests
 
 ### Deduplication Benefits
 

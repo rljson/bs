@@ -30,7 +30,7 @@ describe('BsPeer request timeouts', () => {
         expect(bsPeer.isOpen).toBe(true);
 
         const pending = expect(bsPeer.getBlob('some-id')).rejects.toThrow(
-          "Timeout after 30000ms on 'getBlob'",
+          "Timeout after 30000ms on 'getBlobProperties'",
         );
 
         await vi.advanceTimersByTimeAsync(30_000);

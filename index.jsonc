@@ -1,0 +1,39 @@
+// @license
+// Copyright (c) rljson
+//
+// Use of this source code is governed by terms that can be
+// found in the LICENSE file in the root of this package.
+
+{
+  // The package name, as declared in pubspec.yaml / package.json.
+  "name": "@rljson/bs",
+
+  // 1-2 sentence summary about this repo.
+  "summary": "Content-addressed blob storage interface: blobs stored as content-defined blocks (FastCDC, 256 KB / 1 MB / 4 MB), each block once; memory, peer, server, multi-tier implementations.",
+
+  // 1-3 bullet points: the problem space.
+  "domain": [
+    "Bs interface: blobs, blocks, block lists",
+    "FastCDC chunking, SHA-256 ids, block/blob verification",
+    "socket transport: one block per message, BsMulti cascade with block cache"
+  ],
+
+  // The repos this one depends on and the repos depending on it.
+  // Keep the reason or the API behind each entry, not just the name.
+  "interfaces": {
+    // "<repo-a>": "why / API"
+    "uses": {
+      "rljson": "types",
+      "json": "types",
+      "hash": "test: ids agree with hshBuffer"
+    },
+
+    // "<repo-b>": "why / API"
+    "usedBy": {
+      "bs-fs": "Bs, block helpers (writeBlocks, readBlocks, streamBlocks, verifyBlob)",
+      "server": "BsPeer, BsServer, BsPeerBridge, BsMulti, readBlocks, streamBlocks",
+      "fs-agent": "Bs, BsMem",
+      "mongo-agent": "Bs"
+    }
+  }
+}

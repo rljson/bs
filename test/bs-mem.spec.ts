@@ -20,6 +20,17 @@ describe('BsMem - Implementation Specific', () => {
     storage = new BsMem();
   });
 
+  describe('blockCount', () => {
+    it('counts each block once, however many blobs contain it', async () => {
+      await storage.setBlob('Same');
+      await storage.setBlob('Same');
+      await storage.setBlob('Other');
+      expect(storage.blockCount).toBe(2);
+      storage.clear();
+      expect(storage.blockCount).toBe(0);
+    });
+  });
+
   describe('clear()', () => {
     it('should remove all blobs', async () => {
       await storage.setBlob('Blob 1');
