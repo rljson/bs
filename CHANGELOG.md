@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### The build keeps every Node builtin external
+
+- **0.1.0 does not work in Node:** its build replaced `node:crypto` with
+  vite's empty browser shim, so `ContentId` — and with it every `setBlob` —
+  threw `createHash is not a function`. The tests ran against the sources
+  and passed. The build now keeps every `node:` module external, and
+  `test/vite-config.spec.ts` fails when one the sources import is not.
+
+## [0.1.0]
+
 ### Blobs are stored and moved as blocks — breaking
 
 - **Every blob is cut into blocks** at boundaries the content decides

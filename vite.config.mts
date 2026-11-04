@@ -26,7 +26,12 @@ export default defineConfig({
         '@rljson/json',
         '@rljson/hash',
         // Add all peer depencies from package.json here
-        'node:stream',
+        //
+        // Every Node builtin, by pattern. One left out is replaced by vite's
+        // browser shim, which exports nothing: `node:crypto` was missing, and
+        // the published build threw `createHash is not a function` on its
+        // first block — while every test passed against the sources.
+        /^node:/,
       ],
       output: {
         globals: {},
